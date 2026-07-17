@@ -95,7 +95,7 @@ jobs:
       # THIS repo, then rolled out to consumers as a new release-workflow tag.
       - name: Compute the next version
         id: version
-        uses: ekwi-tech/next-version-action@e3a828a0165905c0719df3f79f8cdb5be93336d6 # v0.1.0
+        uses: ekwi-tech/next-version-action@72c193072ee41787419bebe8e9c697999d81c1e3 # v0.1.1
         with:
           prerelease: ${{ inputs.channel == 'pre-release' }}
           initial-version: ${{ inputs.initial-version }}
