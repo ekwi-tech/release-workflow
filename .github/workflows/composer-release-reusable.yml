@@ -43,13 +43,11 @@ jobs:
     name: Compute the version, prove CI green, tag and publish
     runs-on: ubuntu-latest
     timeout-minutes: 10   # version + notes + publish are quick; a hung gh/api call must not hold a write job for hours
-    # Declared for documentation; the effective token is capped by what the CALLER grants. A dry-run self-test
-    # may run with only read (fork PRs are read-only regardless) — the write steps are skipped there.
-    permissions:
-      contents: write        # create the tag + the GitHub Release
-      actions: read          # read CI's conclusion for the green gate
-      pull-requests: read    # release-notes-action resolves each commit's PR author/number
-
+    # NO job-level `permissions:` here — on purpose. A reusable workflow's declared permissions must be a SUBSET of
+    # what the calling job grants; GitHub rejects the run at STARTUP (not clamps) if this asks for more. Declaring
+    # `contents: write` would therefore force EVERY caller to grant write — breaking the read-only dry-run self-test
+    # and read-only Dependabot PRs. Instead we inherit the caller's grant: real callers grant `contents: write`
+    # (see the README snippet and release.yml), the self-test grants only `read` and skips the write steps.
     steps:
       # Fail loudly on a bad contract rather than mis-releasing in silence. An unknown channel would otherwise
       # fall through the `== 'pre-release'` test into a STABLE release; an empty ci-workflows would make the green
