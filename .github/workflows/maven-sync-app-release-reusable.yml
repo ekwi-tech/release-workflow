@@ -1,0 +1,252 @@
+name: Maven sync-app release (reusable)
+
+# The ekwi-sync CLIENT release — a deployable Spring Boot fat jar — as a reusable workflow (workflow_call). It
+# builds, tests and analyses the jar, then attaches it (with its SBOM and checksums) to a GitHub Release;
+# deployment to the target server is manual. Every sync client used to carry this whole file, re-synchronised
+# from the skeleton on each fleet update; now the client carries a ~12-line caller and this logic lives once.
+#
+# It USES next-version-action and release-notes-action, pinned by SHA — a one-way dependency (they do not use
+# this workflow). NOT for ekwi-sync-common: that is a multi-module library that DEPLOYS to the Maven registry,
+# a different flow kept bespoke.
+on:
+  workflow_call:
+    inputs:
+      channel:
+        description: 'pre-release (cuts X.Y.Z-beta.N) or latest (cuts a stable X.Y.Z). Forwarded from the caller''s dispatch.'
+        required: true
+        type: string
+      initial-version:
+        description: 'Version for the very first release, when the repository has no tag yet.'
+        required: false
+        type: string
+        default: '0.1.0'
+      ci-workflows:
+        description: 'Space-separated workflow filenames that must have a successful run on the release commit — the green gate.'
+        required: true
+        type: string
+      java-version:
+        description: 'JDK version for the release build. Defaults to the fleet standard.'
+        required: false
+        type: string
+        default: '25'
+      java-distribution:
+        description: 'JDK distribution for the release build.'
+        required: false
+        type: string
+        default: temurin
+      dry-run:
+        description: 'Build and stage everything but do NOT tag or publish — for a client-side self-test. Also skips the main-branch and green-gate checks.'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      packages-token:
+        description: 'A token that can READ ekwi-sync-common''s packages from the Maven registry (repository-scoped, so the built-in token cannot). ekwi-bot''s EKWI_PACKAGES_TOKEN, provisioned by "New sync repository".'
+        required: true
+
+# One release at a time, per consuming repo — concurrency groups are repo-scoped. Keyed on the ref so a dry-run
+# self-test (on a PR) never contends with a real release on main. cancel-in-progress: false — an interrupted run
+# could leave a tag without the release that documents it. Centralised HERE so a caller cannot forget it.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build the deployable fat jar, tag and release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20   # a Maven verify + package is heavier than the tag-only flow, but must not hang for hours
+    permissions:
+      contents: write     # create the git tag + GitHub Release (fat jar, SBOM, checksums)
+      actions: read       # read CI check-runs for the green-build gate
+      pull-requests: read # release-notes-action resolves each commit's PR author/number
+
+    steps:
+      # Fail loudly on a bad contract rather than mis-releasing in silence: an unknown channel would fall through
+      # into a STABLE release; an empty ci-workflows would make the green gate pass without checking anything.
+      - name: Validate inputs
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          CI_WORKFLOWS: ${{ inputs.ci-workflows }}
+          INITIAL_VERSION: ${{ inputs.initial-version }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          set -euo pipefail
+          case "${CHANNEL}" in
+            pre-release|latest) ;;
+            *) echo "::error::channel must be 'pre-release' or 'latest', got '${CHANNEL}'"; exit 1 ;;
+          esac
+          if ! printf '%s' "${INITIAL_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::initial-version must be X.Y.Z (no leading v), got '${INITIAL_VERSION}'"
+            exit 1
+          fi
+          if [ "${DRY_RUN}" != "true" ] && [ -z "${CI_WORKFLOWS// /}" ]; then
+            echo "::error::ci-workflows is empty — the green gate would pass without checking anything"
+            exit 1
+          fi
+
+      # Real runs publish from main only. Skipped under dry-run: the self-test runs on a PR branch.
+      - name: Refuse to release from a branch other than main
+        if: ${{ !inputs.dry-run }}
+        run: |
+          if [ "${GITHUB_REF_NAME}" != "main" ]; then
+            echo "::error::Releases are cut from main only — this run targets '${GITHUB_REF_NAME}'"
+            exit 1
+          fi
+
+      # fetch-depth: 0 — next-version-action and release-notes-action read every tag and the full commit graph,
+      # and refuse a shallow clone. persist-credentials: false keeps the token out of .git/config.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Compute the next version
+        id: version
+        uses: ekwi-tech/next-version-action@e3a828a0165905c0719df3f79f8cdb5be93336d6 # v0.1.0
+        with:
+          prerelease: ${{ inputs.channel == 'pre-release' }}
+          initial-version: ${{ inputs.initial-version }}
+
+      - name: Refuse to overwrite an existing tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
+            echo "::error::Tag v${VERSION} already exists"
+            exit 1
+          fi
+
+      # "Green before ship." Gates on the caller-named CI workflows for THIS exact commit. Skipped under dry-run
+      # (a PR SHA has no release-time CI history yet).
+      - name: Require a successful CI run on this commit
+        if: ${{ !inputs.dry-run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_WORKFLOWS: ${{ inputs.ci-workflows }}
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          for wf in ${CI_WORKFLOWS}; do
+            if ! ok="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?head_sha=${SHA}" \
+              --jq '[.workflow_runs[] | select(.conclusion == "success")] | length')"; then
+              echo "::error::Could not query runs for '${wf}' — does .github/workflows/${wf} exist?"
+              exit 1
+            fi
+            if [ "${ok}" -eq 0 ]; then
+              echo "::error::No successful '${wf}' run for ${SHA} — refusing to release an untested commit"
+              exit 1
+            fi
+            echo "  ${wf}: green for ${SHA}"
+          done
+
+      - uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5.5.0
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: ${{ inputs.java-distribution }}
+          cache: maven
+
+      # Version the artifact for this build only — never committed back. The tag points to HEAD as-is; the POM
+      # stays at SNAPSHOT in the repo. versions-maven-plugin is pinned in the parent's pluginManagement.
+      - name: Set the POM version for the release build
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          # Scoped to the mvnw steps, not job-wide: the repo-scoped registry read of ekwi-sync-common's
+          # parent/core needs this cross-repo credential (the client's settings.xml binds the <server> to these
+          # vars); no other step — or third-party action — should ever see it.
+          EKWI_PACKAGES_ACTOR: ekwi-bot
+          EKWI_PACKAGES_TOKEN: ${{ secrets.packages-token }}
+        run: |
+          ./mvnw --batch-mode versions:set \
+            -DnewVersion="$VERSION" \
+            -DgenerateBackupPoms=false
+
+      # verify, not package: runs the tests, SpotBugs, and the parent's requireReleaseDeps enforcer rule (a
+      # release must not depend on a SNAPSHOT). Also produces target/sbom.json.
+      - name: Build, test, analyse and package the fat jar
+        env:
+          EKWI_PACKAGES_ACTOR: ekwi-bot
+          EKWI_PACKAGES_TOKEN: ${{ secrets.packages-token }}   # cross-repo registry read; scoped to this step
+        run: ./mvnw --batch-mode verify
+
+      # A vulnerability disclosed since the last CI run must not ship. Same gate as the PR, on the exact bytes.
+      - name: Trivy — fail on fixable HIGH/CRITICAL
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: sbom
+          scan-ref: target/sbom.json
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          format: table
+
+      # Derive the jar path dynamically so nothing depends on the client's artifactId or finalName — this logic
+      # is shared by every client and must not need a per-client edit. spring-boot repackage leaves the thin jar
+      # as *.jar.original and the runnable fat jar as *.jar, so target/*.jar matches exactly one file.
+      - name: Stage release assets
+        id: assets
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          jars=(target/*.jar)
+          if [ ${#jars[@]} -ne 1 ]; then
+            echo "::error::Expected exactly one runnable jar in target/, found: ${jars[*]:-none}"
+            exit 1
+          fi
+          base="$(basename "${jars[0]}" .jar)"
+
+          cd target
+          mv "${base}.jar" "${base}-${VERSION}.jar"
+          cp sbom.json "${base}-${VERSION}-sbom.json"
+          sha256sum \
+            "${base}-${VERSION}.jar" \
+            "${base}-${VERSION}-sbom.json" \
+            > "${base}-${VERSION}-SHA256SUMS.txt"
+          cat "${base}-${VERSION}-SHA256SUMS.txt"
+          echo "base=${base}" >> "$GITHUB_OUTPUT"
+
+      # Reset immediately so the working tree is clean — the tag must point to the unmodified HEAD.
+      - name: Reset the POM to SNAPSHOT
+        if: always()
+        run: git checkout -- pom.xml
+
+      # Shared notes rendering (canonical cliff.toml + pinned git-cliff live in the action). Same one-way SHA pin.
+      - name: Generate the release notes
+        id: notes
+        uses: ekwi-tech/release-notes-action@7d1b76089de232d7c0c690fd5603e3ed1083a08d # v0.1.0
+        with:
+          version: ${{ steps.version.outputs.version }}
+          token: ${{ github.token }}
+
+      # gh release create creates the tag atomically via the API and attaches the deployable. Under dry-run,
+      # print what would ship instead. A hyphen in the version means pre-release, excluded from GitHub's "Latest".
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          NOTES_FILE: ${{ steps.notes.outputs.notes-file }}
+          BASE: ${{ steps.assets.outputs.base }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          set -euo pipefail
+          prerelease_flag=""
+          case "$VERSION" in *-*) prerelease_flag="--prerelease" ;; esac
+
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "::notice::[dry-run] would publish v${VERSION} ${prerelease_flag:-(latest)} with assets:"
+            ls -1 "target/${BASE}-${VERSION}.jar" "target/${BASE}-${VERSION}-sbom.json" "target/${BASE}-${VERSION}-SHA256SUMS.txt"
+            echo "----- notes -----"; cat "${NOTES_FILE}"; echo "-----------------"
+            exit 0
+          fi
+
+          gh release create "v${VERSION}" \
+            --target "$(git rev-parse HEAD)" \
+            --title "${VERSION}" \
+            --notes-file "${NOTES_FILE}" \
+            $prerelease_flag \
+            "target/${BASE}-${VERSION}.jar" \
+            "target/${BASE}-${VERSION}-sbom.json" \
+            "target/${BASE}-${VERSION}-SHA256SUMS.txt"

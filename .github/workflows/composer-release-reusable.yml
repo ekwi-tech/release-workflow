@@ -1,0 +1,166 @@
+name: Composer release (reusable)
+
+# The fleet's TAG-ONLY release orchestration, as a reusable workflow (workflow_call): a tag-only repo (a Composer
+# package, a CLI, this repo itself) publishes by creating a git tag + GitHub Release. The steps around that —
+# refuse a non-main run, derive the version, prove CI is green, render the notes, publish — were copied into
+# every release.yml; here they live once and a consumer carries a ~12-line caller.
+#
+# It USES next-version-action and release-notes-action, pinned by SHA — a ONE-WAY dependency: they do not use
+# this workflow (they dogfood their own release), so there is no cycle. Maven repos deploy artifacts, a flow this
+# does not model — see maven-sync-app-release-reusable.yml.
+on:
+  workflow_call:
+    inputs:
+      channel:
+        description: 'pre-release (cuts X.Y.Z-beta.N) or latest (cuts a stable X.Y.Z). Forwarded from the caller''s dispatch.'
+        required: true
+        type: string
+      initial-version:
+        description: 'Version emitted for the very first release, when the repository has no tag yet.'
+        required: false
+        type: string
+        default: '0.1.0'
+      ci-workflows:
+        description: 'Space-separated workflow filenames that must have a successful run on the release commit — the green gate (e.g. "ci.yml" or "test.yml quality.yml").'
+        required: true
+        type: string
+      dry-run:
+        description: 'Exercise everything except tag/release creation — for the self-test. Also skips the main-branch and green-gate checks, which cannot hold on a PR.'
+        required: false
+        type: boolean
+        default: false
+
+# One release at a time, per consuming repo — concurrency groups are repo-scoped. Keyed on the ref so a dry-run
+# self-test (which calls this workflow on a PR) never contends with a real release on main. cancel-in-progress:
+# false — an interrupted run could leave a tag without the release that documents it. Centralised HERE so a
+# caller cannot forget it.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Compute the version, prove CI green, tag and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10   # version + notes + publish are quick; a hung gh/api call must not hold a write job for hours
+    # Declared for documentation; the effective token is capped by what the CALLER grants. A dry-run self-test
+    # may run with only read (fork PRs are read-only regardless) — the write steps are skipped there.
+    permissions:
+      contents: write        # create the tag + the GitHub Release
+      actions: read          # read CI's conclusion for the green gate
+      pull-requests: read    # release-notes-action resolves each commit's PR author/number
+
+    steps:
+      # Fail loudly on a bad contract rather than mis-releasing in silence. An unknown channel would otherwise
+      # fall through the `== 'pre-release'` test into a STABLE release; an empty ci-workflows would make the green
+      # gate loop zero times and pass without checking anything. Both are caller mistakes worth an early stop.
+      - name: Validate inputs
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          CI_WORKFLOWS: ${{ inputs.ci-workflows }}
+          INITIAL_VERSION: ${{ inputs.initial-version }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          set -euo pipefail
+          case "${CHANNEL}" in
+            pre-release|latest) ;;
+            *) echo "::error::channel must be 'pre-release' or 'latest', got '${CHANNEL}'"; exit 1 ;;
+          esac
+          if ! printf '%s' "${INITIAL_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::initial-version must be X.Y.Z (no leading v), got '${INITIAL_VERSION}'"
+            exit 1
+          fi
+          if [ "${DRY_RUN}" != "true" ] && [ -z "${CI_WORKFLOWS// /}" ]; then
+            echo "::error::ci-workflows is empty — the green gate would pass without checking anything"
+            exit 1
+          fi
+
+      # Real runs publish from main only. Skipped under dry-run: the self-test runs on a PR branch.
+      - name: Refuse to release from a branch other than main
+        if: ${{ !inputs.dry-run }}
+        run: |
+          if [ "${GITHUB_REF_NAME}" != "main" ]; then
+            echo "::error::Releases are cut from main only — this run targets '${GITHUB_REF_NAME}'"
+            exit 1
+          fi
+
+      # fetch-depth: 0 — next-version-action and release-notes-action both read every tag and the full commit
+      # graph, and refuse a shallow clone. persist-credentials: false keeps the token out of .git/config.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The shared version policy. Pinned by SHA here so a consumer never carries it; bumped by Dependabot in
+      # THIS repo, then rolled out to consumers as a new release-workflow tag.
+      - name: Compute the next version
+        id: version
+        uses: ekwi-tech/next-version-action@e3a828a0165905c0719df3f79f8cdb5be93336d6 # v0.1.0
+        with:
+          prerelease: ${{ inputs.channel == 'pre-release' }}
+          initial-version: ${{ inputs.initial-version }}
+
+      - name: Refuse to overwrite an existing tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
+            echo "::error::Tag v${VERSION} already exists"
+            exit 1
+          fi
+
+      # "Green before ship." Gates on the caller-named CI workflows for THIS exact commit — a squash merge mints
+      # a new SHA the PR run never covered. Skipped under dry-run (a PR SHA has no release-time CI history yet).
+      - name: Require a successful CI run on this commit
+        if: ${{ !inputs.dry-run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_WORKFLOWS: ${{ inputs.ci-workflows }}
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          for wf in ${CI_WORKFLOWS}; do
+            if ! ok="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?head_sha=${SHA}" \
+              --jq '[.workflow_runs[] | select(.conclusion == "success")] | length')"; then
+              echo "::error::Could not query runs for '${wf}' — does .github/workflows/${wf} exist?"
+              exit 1
+            fi
+            if [ "${ok}" -eq 0 ]; then
+              echo "::error::No successful '${wf}' run for ${SHA} — refusing to release an untested commit"
+              exit 1
+            fi
+            echo "  ${wf}: green for ${SHA}"
+          done
+
+      # Shared notes rendering (canonical cliff.toml + pinned git-cliff live in the action). Same one-way SHA pin.
+      - name: Generate the release notes
+        id: notes
+        uses: ekwi-tech/release-notes-action@7d1b76089de232d7c0c690fd5603e3ed1083a08d # v0.1.0
+        with:
+          version: ${{ steps.version.outputs.version }}
+          token: ${{ github.token }}
+
+      # Publishing == creating the tag + Release (tag-only repos resolve versions from the tag). A hyphen in the
+      # version means pre-release, excluded from GitHub's "Latest". Under dry-run, print what would ship instead.
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          NOTES_FILE: ${{ steps.notes.outputs.notes-file }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          set -euo pipefail
+          prerelease_flag=""
+          case "$VERSION" in *-*) prerelease_flag="--prerelease" ;; esac
+
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "::notice::[dry-run] would publish v${VERSION} ${prerelease_flag:-(latest)} with notes:"
+            echo "----- notes -----"; cat "${NOTES_FILE}"; echo "-----------------"
+            exit 0
+          fi
+
+          gh release create "v${VERSION}" \
+            --target "$(git rev-parse HEAD)" \
+            --title "${VERSION}" \
+            --notes-file "${NOTES_FILE}" \
+            $prerelease_flag
