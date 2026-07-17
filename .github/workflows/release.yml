@@ -1,0 +1,34 @@
+name: Release
+
+# Cuts a tag + GitHub Release for THIS repo, by DOGFOODING its own reusable workflow (`uses: ./…`). A change
+# that breaks the orchestration breaks this repo's own release first — the earliest possible signal, exactly as
+# next-version-action and release-notes-action dogfood themselves.
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Release channel — pre-release cuts X.Y.Z-beta.N, latest cuts a stable X.Y.Z.'
+        required: true
+        default: pre-release
+        type: choice
+        options:
+          - pre-release
+          - latest
+
+permissions: {}
+
+# No concurrency block here on purpose — the "one release at a time" guard is centralised in the reusable
+# workflow, so no caller has to remember it.
+jobs:
+  release:
+    # The caller grants the token scope; the reusable consumes GITHUB_TOKEN, which is passed automatically — no
+    # secrets: inherit needed (the reusable references no user-defined secret).
+    permissions:
+      contents: write
+      actions: read
+      pull-requests: read
+    uses: ./.github/workflows/composer-release-reusable.yml
+    with:
+      channel: ${{ inputs.channel }}
+      initial-version: '0.1.0'
+      ci-workflows: 'ci.yml'

@@ -1,0 +1,35 @@
+name: Semantic PR Title
+
+# This repo's version is DERIVED from the Conventional Commits on main (via next-version-action, through its own
+# reusable workflow). An unparseable subject is a correctness problem, not a style one, and it fails silently: a
+# `feat` merged as "add the thing" is read as a patch. Squash-merge makes the PR title the commit subject, so
+# validating the title validates the commit. Make this a REQUIRED check in a ruleset to give it teeth.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  validate-pr-title:
+    name: Enforce Conventional Commits format on PR title
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # The same ten types as the rest of the fleet — one vocabulary everywhere.
+          types: |
+            feat
+            fix
+            perf
+            refactor
+            build
+            chore
+            ci
+            docs
+            style
+            test
+          requireScope: false

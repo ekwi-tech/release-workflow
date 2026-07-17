@@ -1,0 +1,8 @@
+# Code ownership for release-workflow. The reusable release workflows in `.github/workflows/`
+# (composer-release-reusable.yml, maven-sync-app-release-reusable.yml) are the release ORCHESTRATION for the fleet — a
+# change here ships into every consumer's next release. Reviews are not about style.
+#
+# This routes every PR's reviewer, Dependabot included: GitHub removed dependabot.yml's reviewers: option on
+# 2025-08-08 and pointed here. It REQUESTS review, does not require it — this repo is not under the ekwi-sync-*
+# ruleset, so the enforced signal is the CI gate. Replace @ssylla with a team once a second reviewer exists.
+* @ssylla
