@@ -1,0 +1,69 @@
+name: CI
+
+# Validates the reusable workflows: actionlint lints them all, and a dry-run self-test exercises the tag-only
+# (composer) one end to end. The Maven reusable is lint-only here — this repo has no Maven project to run it
+# against; it is proven by the first client that adopts it.
+# Running on main is not redundant — release.yml refuses to publish a commit with no successful CI run against
+# its own SHA, and a squash merge mints a brand-new SHA the PR run never covered.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  lint-workflows:
+    name: Lint GitHub Actions workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Run actionlint
+        uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
+        with:
+          args: -color
+
+  # Exercises the reusable workflow END TO END without cutting a real release: dry-run runs the version and notes
+  # steps (the two wrapped actions, wired together) and skips the main-branch / green-gate / publish steps that
+  # cannot hold on a PR. This is the composite of both actions proven, the same spirit as their own self-tests.
+  self-test:
+    name: Exercise the reusable workflow (dry-run)
+    # Least privilege: dry-run creates nothing, so read is enough. GitHub clamps the reusable workflow's declared
+    # permissions down to what the caller grants (no error), and the write-only steps are skipped under dry-run.
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    uses: ./.github/workflows/composer-release-reusable.yml
+    with:
+      channel: pre-release
+      initial-version: '0.1.0'
+      ci-workflows: ''      # unused: the green gate is skipped under dry-run
+      dry-run: true
+
+  # THE required status check, and the only one a ruleset should name. Every job above is a `needs:` here, so
+  # adding one extends what "green" means without anyone touching the ruleset.
+  ci-gate:
+    name: CI gate
+    if: always()
+    needs: [lint-workflows, self-test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job must have succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "upstream results: $RESULTS"
+          for r in $RESULTS; do
+            [ "$r" = "success" ] || { echo "::error::A required job did not succeed ($r)."; exit 1; }
+          done
