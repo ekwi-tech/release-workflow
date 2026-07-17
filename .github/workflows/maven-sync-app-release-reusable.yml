@@ -101,7 +101,7 @@ jobs:
 
       - name: Compute the next version
         id: version
-        uses: ekwi-tech/next-version-action@e3a828a0165905c0719df3f79f8cdb5be93336d6 # v0.1.0
+        uses: ekwi-tech/next-version-action@72c193072ee41787419bebe8e9c697999d81c1e3 # v0.1.1
         with:
           prerelease: ${{ inputs.channel == 'pre-release' }}
           initial-version: ${{ inputs.initial-version }}
@@ -138,7 +138,7 @@ jobs:
             echo "  ${wf}: green for ${SHA}"
           done
 
-      - uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5.5.0
+      - uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           java-version: ${{ inputs.java-version }}
           distribution: ${{ inputs.java-distribution }}
