@@ -89,8 +89,10 @@ It also accepts `java-version` (default `25`) and `java-distribution` (default `
 
 ## Requirements
 
-- The caller grants `contents: write`, `actions: read`, `pull-requests: read` (see the snippets). The tag-only
-  workflow needs no secrets — it uses only the automatic `GITHUB_TOKEN`; the Maven client additionally passes the
+- The caller **must** grant `contents: write`, `actions: read`, `pull-requests: read` (see the snippets). The
+  reusable declares no permissions of its own and inherits the caller's grant — a reusable that asked for more
+  than the caller granted would fail at startup, so the grant lives with the caller, once. The tag-only workflow
+  needs no secrets — it uses only the automatic `GITHUB_TOKEN`; the Maven client additionally passes the
   `packages-token` named secret shown above.
 - The actions and this workflow are **public**, so any consumer — public or private — resolves them with no
   access setting (see *Why this is public* below).

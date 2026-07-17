@@ -38,8 +38,9 @@ jobs:
   # cannot hold on a PR. This is the composite of both actions proven, the same spirit as their own self-tests.
   self-test:
     name: Exercise the reusable workflow (dry-run)
-    # Least privilege: dry-run creates nothing, so read is enough. GitHub clamps the reusable workflow's declared
-    # permissions down to what the caller grants (no error), and the write-only steps are skipped under dry-run.
+    # Least privilege: dry-run creates nothing, so read is enough. This is the CALLER's grant, and the reusable
+    # inherits it — the reusable declares no permissions of its own precisely so a read-only caller is valid (a
+    # reusable asking for more than the caller grants fails at startup). The write steps are skipped under dry-run.
     permissions:
       contents: read
       actions: read

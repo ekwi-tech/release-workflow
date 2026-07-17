@@ -56,11 +56,9 @@ jobs:
     name: Build the deployable fat jar, tag and release
     runs-on: ubuntu-latest
     timeout-minutes: 20   # a Maven verify + package is heavier than the tag-only flow, but must not hang for hours
-    permissions:
-      contents: write     # create the git tag + GitHub Release (fat jar, SBOM, checksums)
-      actions: read       # read CI check-runs for the green-build gate
-      pull-requests: read # release-notes-action resolves each commit's PR author/number
-
+    # NO job-level `permissions:` here — see the note in composer-release-reusable.yml. A reusable workflow cannot
+    # request more than the caller grants (startup failure, not clamped), so we inherit the caller's grant: real
+    # callers grant `contents: write`, a read-only dry-run self-test skips the write steps.
     steps:
       # Fail loudly on a bad contract rather than mis-releasing in silence: an unknown channel would fall through
       # into a STABLE release; an empty ci-workflows would make the green gate pass without checking anything.
