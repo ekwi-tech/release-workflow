@@ -1,4 +1,4 @@
-name: Semantic PR Title (reusable)
+name: Reusable — Conventional Commit PR Title
 
 # The fleet's Conventional-Commit PR-title check, as a reusable workflow (workflow_call). It was copied — action
 # pin and the ten-type vocabulary — into every repo's commitlint.yml; here it lives once and a consumer carries a
@@ -9,9 +9,10 @@ name: Semantic PR Title (reusable)
 # correctness problem, not a style one, and it fails SILENTLY — a `feat` merged as "add the thing" is read as a
 # patch. Squash-merge makes the PR title the commit subject, so validating the title validates the commit.
 #
-# Make the resulting check REQUIRED in each consumer's ruleset to give it teeth. NOTE: routing through a reusable
-# renames the check to "<caller-job> / validate-pr-title" (here "title / validate-pr-title") — update the
-# ruleset's required status check to that name, or the gate stops blocking without failing.
+# Make the resulting check REQUIRED in each consumer's ruleset. NOTE: a reusable-workflow check is named on THREE
+# load-bearing segments — "<caller workflow name> / <caller job id> / <this job's name>", here "Conventional
+# Commit PR Title / title / Enforce Conventional Commits format on PR title" (the shown "(pull_request)" is the
+# event, not the name). Pick it from the ruleset's detected list, don't type it; reword none once required.
 on:
   workflow_call:
 
@@ -19,6 +20,8 @@ on:
 # at startup. The caller grants `pull-requests: read`, which the action reads through the automatic GITHUB_TOKEN.
 
 jobs:
+  # This `name:` is the last of those three segments — keep it, the caller's job id `title`, and the caller
+  # workflow name all stable across the fleet, or rulesets break (see the NOTE above).
   validate-pr-title:
     name: Enforce Conventional Commits format on PR title
     runs-on: ubuntu-latest

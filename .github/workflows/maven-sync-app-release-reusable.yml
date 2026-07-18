@@ -1,4 +1,4 @@
-name: Maven sync-app release (reusable)
+name: Reusable — Maven sync-app release
 
 # The ekwi-sync CLIENT release — a deployable Spring Boot fat jar — as a reusable workflow (workflow_call). It
 # builds, tests and analyses the jar, then attaches it (with its SBOM and checksums) to a GitHub Release;
