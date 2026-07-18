@@ -1,0 +1,43 @@
+name: Semantic PR Title (reusable)
+
+# The fleet's Conventional-Commit PR-title check, as a reusable workflow (workflow_call). It was copied — action
+# pin and the ten-type vocabulary — into every repo's commitlint.yml; here it lives once and a consumer carries a
+# ~8-line caller. Bump the pin or the vocabulary in ONE place, and the fleet adopts it through the caller's ref.
+#
+# Why this matters, not merely why it is DRY: each repo's version is DERIVED from its Conventional Commits (via
+# next-version-action) and its notes rendered from them (via release-notes-action). An unparseable subject is a
+# correctness problem, not a style one, and it fails SILENTLY — a `feat` merged as "add the thing" is read as a
+# patch. Squash-merge makes the PR title the commit subject, so validating the title validates the commit.
+#
+# Make the resulting check REQUIRED in each consumer's ruleset to give it teeth. NOTE: routing through a reusable
+# renames the check to "<caller-job> / validate-pr-title" (here "title / validate-pr-title") — update the
+# ruleset's required status check to that name, or the gate stops blocking without failing.
+on:
+  workflow_call:
+
+# No `permissions:` block, by fleet convention: a reusable that asked for more than the caller granted would fail
+# at startup. The caller grants `pull-requests: read`, which the action reads through the automatic GITHUB_TOKEN.
+
+jobs:
+  validate-pr-title:
+    name: Enforce Conventional Commits format on PR title
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}   # same token the release reusables use — one form across the repo
+        with:
+          # The same ten types as the rest of the fleet — one vocabulary everywhere. Mirrors the commit_parsers
+          # in release-notes-action's cliff.toml; keep the two in lockstep.
+          types: |
+            feat
+            fix
+            perf
+            refactor
+            build
+            chore
+            ci
+            docs
+            style
+            test
+          requireScope: false
