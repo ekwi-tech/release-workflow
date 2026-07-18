@@ -8,6 +8,9 @@ name: Maven sync-app release (reusable)
 # It USES next-version-action and release-notes-action, pinned by SHA — a one-way dependency (they do not use
 # this workflow). NOT for ekwi-sync-common: that is a multi-module library that DEPLOYS to the Maven registry,
 # a different flow kept bespoke.
+#
+# Contract: a SINGLE-module, single-jar client. `versions:set` and the "exactly one target/*.jar" guard assume
+# it; a multi-module reactor fails loudly at asset staging (no jar at the aggregator root) — enforced, not silent.
 on:
   workflow_call:
     inputs:
@@ -126,13 +129,24 @@ jobs:
           set -euo pipefail
           SHA="$(git rev-parse HEAD)"
           for wf in ${CI_WORKFLOWS}; do
-            if ! ok="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?head_sha=${SHA}" \
-              --jq '[.workflow_runs[] | select(.conclusion == "success")] | length')"; then
-              echo "::error::Could not query runs for '${wf}' — does .github/workflows/${wf} exist?"
+            # Capture the body (2>&1) so an HTTP error is told apart from a legitimately-absent green run.
+            if ! runs="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?head_sha=${SHA}&per_page=100" 2>&1)"; then
+              case "$runs" in
+                *'HTTP 403'*) echo "::error::Cannot read Actions runs for '${wf}' — the caller must grant 'actions: read'" ;;
+                *'HTTP 404'*) echo "::error::Workflow '${wf}' not found — does .github/workflows/${wf} exist?" ;;
+                *)            echo "::error::Querying runs for '${wf}' failed: ${runs}" ;;
+              esac
               exit 1
             fi
-            if [ "${ok}" -eq 0 ]; then
-              echo "::error::No successful '${wf}' run for ${SHA} — refusing to release an untested commit"
+            green="$(printf '%s' "$runs" | jq '[.workflow_runs[] | select(.conclusion == "success")] | length')"
+            if [ "${green}" -eq 0 ]; then
+              # Still-running vs ran-and-failed: the operator's fix differs (wait vs investigate).
+              running="$(printf '%s' "$runs" | jq '[.workflow_runs[] | select(.status != "completed")] | length')"
+              if [ "${running}" -gt 0 ]; then
+                echo "::error::'${wf}' is still running for ${SHA} — wait for it to go green, then re-dispatch"
+              else
+                echo "::error::No successful '${wf}' run for ${SHA} — refusing to release an untested commit"
+              fi
               exit 1
             fi
             echo "  ${wf}: green for ${SHA}"
