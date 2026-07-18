@@ -1,4 +1,4 @@
-name: Reusable — Composer release
+name: _Reusable — Composer release
 
 # The fleet's TAG-ONLY release orchestration, as a reusable workflow (workflow_call): a tag-only repo (a Composer
 # package, a CLI, this repo itself) publishes by creating a git tag + GitHub Release. The steps around that —

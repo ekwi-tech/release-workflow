@@ -1,4 +1,4 @@
-name: Reusable — Conventional Commits on PR Title
+name: _Reusable — Conventional Commits on PR Title
 
 # The fleet's Conventional-Commit PR-title check, as a reusable workflow (workflow_call). It was copied — action
 # pin and the ten-type vocabulary — into every repo's commitlint.yml; here it lives once and a consumer carries a
