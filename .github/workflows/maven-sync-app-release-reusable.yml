@@ -228,7 +228,7 @@ jobs:
       # Shared notes rendering (canonical cliff.toml + pinned git-cliff live in the action). Same one-way SHA pin.
       - name: Generate the release notes
         id: notes
-        uses: ekwi-tech/release-notes-action@7d1b76089de232d7c0c690fd5603e3ed1083a08d # v0.1.0
+        uses: ekwi-tech/release-notes-action@be13002ca33cd7c891de074fc7a1976b2cdb4576 # v0.1.0
         with:
           version: ${{ steps.version.outputs.version }}
           token: ${{ github.token }}
