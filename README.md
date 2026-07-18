@@ -94,7 +94,7 @@ Replace the repo's whole `commitlint.yml` job with a thin caller. No inputs — 
 one everywhere:
 
 ```yaml
-name: Conventional Commit PR Title
+name: Semantic Checks
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
@@ -103,17 +103,18 @@ permissions: {}
 
 jobs:
   title:
+    name: PR title
     permissions:
       pull-requests: read     # the action reads the PR title through the automatic GITHUB_TOKEN
     uses: ekwi-tech/release-workflow/.github/workflows/commitlint-reusable.yml@<sha>   # pin by SHA
 ```
 
 **Make the check required** in the repo's ruleset — but mind the name. A reusable-workflow check is named on three
-segments: `<caller workflow name> / <caller job id> / <reusable job name>`, e.g. for the caller above
-`Conventional Commit PR Title / title / Enforce Conventional Commits format on PR title`. **Select it from the
-ruleset's detected-checks list** rather than typing it. For a fleet-uniform required check, keep all three stable
-across consumers — the caller workflow `name: Conventional Commit PR Title`, the job id `title`, and (never
-reworded) the reusable's job name; changing any one silently stops the gate blocking.
+segments: `<caller workflow name> / <caller job name> / <reusable job name>`, i.e. with the caller above
+`Semantic Checks / PR title / Conventional Commits on PR Title`. **Select it from the ruleset's detected-checks
+list** rather than typing it. For a fleet-uniform required check, keep all three stable across consumers — the
+caller workflow `name: Semantic Checks`, the job `name: PR title`, and (never reworded) the reusable's job name;
+changing any one silently stops the gate blocking.
 
 ## Inputs (shared)
 
