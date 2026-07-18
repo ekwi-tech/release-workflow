@@ -101,7 +101,7 @@ jobs:
 
       - name: Compute the next version
         id: version
-        uses: ekwi-tech/next-version-action@72c193072ee41787419bebe8e9c697999d81c1e3 # v0.1.1
+        uses: ekwi-tech/next-version-action@32e2b9c8d1c1dac081026d43f5f4c8376793778f # v0.1.2
         with:
           prerelease: ${{ inputs.channel == 'pre-release' }}
           initial-version: ${{ inputs.initial-version }}
