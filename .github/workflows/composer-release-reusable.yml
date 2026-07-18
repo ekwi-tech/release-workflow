@@ -93,7 +93,7 @@ jobs:
       # THIS repo, then rolled out to consumers as a new release-workflow tag.
       - name: Compute the next version
         id: version
-        uses: ekwi-tech/next-version-action@6bc05ac16f2b8c1906710f3c6b462f6c26ad631f # v0.1.3
+        uses: ekwi-tech/next-version-action@6bc05ac16f2b8c1906710f3c6b462f6c26ad631f # v0.1.0
         with:
           prerelease: ${{ inputs.channel == 'pre-release' }}
           initial-version: ${{ inputs.initial-version }}
@@ -144,7 +144,7 @@ jobs:
       # Shared notes rendering (canonical cliff.toml + pinned git-cliff live in the action). Same one-way SHA pin.
       - name: Generate the release notes
         id: notes
-        uses: ekwi-tech/release-notes-action@5445480bd1ee2762e02b18740edbc4293c0c6bca # v0.1.1
+        uses: ekwi-tech/release-notes-action@76488d0c9bf8a1d9a8d8677a536232a584bd5f41 # v0.1.0
         with:
           version: ${{ steps.version.outputs.version }}
           token: ${{ github.token }}
