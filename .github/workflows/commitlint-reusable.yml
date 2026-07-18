@@ -1,4 +1,4 @@
-name: Reusable — Conventional Commit PR Title
+name: Reusable — Conventional Commits on PR Title
 
 # The fleet's Conventional-Commit PR-title check, as a reusable workflow (workflow_call). It was copied — action
 # pin and the ten-type vocabulary — into every repo's commitlint.yml; here it lives once and a consumer carries a
@@ -10,9 +10,9 @@ name: Reusable — Conventional Commit PR Title
 # patch. Squash-merge makes the PR title the commit subject, so validating the title validates the commit.
 #
 # Make the resulting check REQUIRED in each consumer's ruleset. NOTE: a reusable-workflow check is named on THREE
-# load-bearing segments — "<caller workflow name> / <caller job id> / <this job's name>", here "Conventional
-# Commit PR Title / title / Enforce Conventional Commits format on PR title" (the shown "(pull_request)" is the
-# event, not the name). Pick it from the ruleset's detected list, don't type it; reword none once required.
+# load-bearing segments — "<caller workflow name> / <caller job name> / <this job's name>", here
+# "Semantic Checks / PR title / Conventional Commits on PR Title" (the shown "(pull_request)" is the event, not
+# the name). Pick it from the ruleset's detected list, don't type it; keep all three stable — reword none once required.
 on:
   workflow_call:
 
@@ -20,10 +20,10 @@ on:
 # at startup. The caller grants `pull-requests: read`, which the action reads through the automatic GITHUB_TOKEN.
 
 jobs:
-  # This `name:` is the last of those three segments — keep it, the caller's job id `title`, and the caller
-  # workflow name all stable across the fleet, or rulesets break (see the NOTE above).
+  # This `name:` is the last of those three segments (see the NOTE). Consumers set the first two — workflow
+  # "Semantic Checks" and job "PR title"; keep all three stable across the fleet, or rulesets break.
   validate-pr-title:
-    name: Enforce Conventional Commits format on PR title
+    name: Conventional Commits on PR Title
     runs-on: ubuntu-latest
     steps:
       - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1

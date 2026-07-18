@@ -1,4 +1,4 @@
-name: Conventional Commit PR Title
+name: Semantic Checks
 
 # Enforces a Conventional-Commit PR title on THIS repo by DOGFOODING its own reusable workflow (`uses: ./…`). A
 # change that breaks the check breaks this repo's own PRs first — the earliest possible signal, exactly as
@@ -11,8 +11,10 @@ permissions: {}
 
 jobs:
   title:
-    # The caller grants the token scope; the reusable consumes GITHUB_TOKEN automatically. This workflow's name +
-    # job id `title` form this repo's required check — full name in commitlint-reusable.yml's NOTE.
+    name: PR title
+    # Workflow name "Semantic Checks" + job name "PR title" + the reusable's job name make this repo's check
+    # "Semantic Checks / PR title / Conventional Commits on PR Title" — see commitlint-reusable.yml's NOTE. The
+    # caller grants the token scope; the reusable consumes GITHUB_TOKEN automatically.
     permissions:
       pull-requests: read
     uses: ./.github/workflows/commitlint-reusable.yml

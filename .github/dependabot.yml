@@ -7,9 +7,10 @@ version: 2
 # assignees is ekwi-bot (the PR is owned by automation; Dependabot honours assignees only for write-access
 # accounts). Who REVIEWS is CODEOWNERS' job — GitHub removed dependabot.yml's reviewers: option on 2025-08-08.
 #
-# NO ignore here: the dependency on the two actions is one-way (they do not use this workflow), so there is no
-# cycle to break. Watching them IS the controlled rollout — a bump lands here, ships as a new release-workflow
-# tag, and consumers adopt it through their own Dependabot PR.
+# NO ignore here — but the reason is no longer "one-way". next-version-action and release-notes-action now DO
+# consume this repo (their commitlint.yml calls commitlint-reusable), while this repo pins them: a cycle. It is
+# broken on THEIR side — each ignores ekwi-tech/release-workflow in its own dependabot.yml — so watching them
+# here stays a one-way controlled rollout: a bump lands here, ships as a new tag, consumers adopt it via their PR.
 updates:
   - package-ecosystem: github-actions
     directory: "/"
