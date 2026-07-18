@@ -1,7 +1,10 @@
 # release-workflow
 
-The ekwi-tech fleet's **release orchestration**, as reusable workflows — one per ecosystem, because the steps
-differ where they must and are shared where they can:
+The ekwi-tech fleet's shared **reusable workflows** — behaviour that was being copied into every repo, kept in
+one place so a consumer carries a thin caller and the fleet adopts a change through its ref.
+
+**Release orchestration** — one reusable per ecosystem, because the steps differ where they must and are shared
+where they can:
 
 - [`composer-release-reusable.yml`](./.github/workflows/composer-release-reusable.yml) — **tag-only** repos (a
   Composer package, a CLI, this repo itself): publish by creating a git tag + GitHub Release.
@@ -12,6 +15,13 @@ differ where they must and are shared where they can:
 
 All derive the version, prove CI is green and render the notes the same way; only the publish differs. The steps
 were being copied into every `release.yml`; here they live once, and a consumer carries a ~12-line caller.
+
+**Quality gate** — shared across every repo regardless of ecosystem:
+
+- [`commitlint-reusable.yml`](./.github/workflows/commitlint-reusable.yml) — enforce a Conventional-Commit PR
+  title (the action pin and the ten-type vocabulary, once). This feeds the same commits that
+  next-version-action and release-notes-action read, so an unparseable title is a correctness problem, not a
+  style one.
 
 Each reusable workflow sits one level above the step-level actions and **uses** them:
 
@@ -77,6 +87,30 @@ jobs:
 ```
 
 It also accepts `java-version` (default `25`) and `java-distribution` (default `temurin`).
+
+## Usage — Conventional-Commit PR title (every repo)
+
+Replace the repo's whole `commitlint.yml` job with a thin caller. No inputs — the vocabulary is fixed on purpose,
+one everywhere:
+
+```yaml
+name: Semantic PR Title
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions: {}
+
+jobs:
+  title:
+    permissions:
+      pull-requests: read     # the action reads the PR title through the automatic GITHUB_TOKEN
+    uses: ekwi-tech/release-workflow/.github/workflows/commitlint-reusable.yml@<sha>   # pin by SHA
+```
+
+**Make the check required** in the repo's ruleset — but mind the name. Routing through a reusable renames the
+check to `<caller-job> / validate-pr-title`, i.e. `title / validate-pr-title` with the job named above. Point the
+ruleset's required status check at that exact name, or the gate silently stops blocking.
 
 ## Inputs (shared)
 
