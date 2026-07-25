@@ -12,6 +12,10 @@ where they can:
   **ekwi-sync clients**: build a Spring Boot fat jar, tag, attach the jar + SBOM + checksums (deployment is
   manual). `ekwi-sync-common` is a multi-module library that *deploys* to the Maven registry — a different flow,
   kept bespoke rather than forced into a shared shape.
+- [`docker-image-release-reusable.yml`](./.github/workflows/docker-image-release-reusable.yml) — **Ekwi instances**:
+  build the per-instance application image (`ekwi_prod`), scan it (Trivy), push it to GHCR (and optionally a
+  self-hosted registry — dual-push), then cut the GitHub Release. The PR CI gate calls the **same** workflow with
+  `dry-run: true` (build + scan only), so the build logic lives once.
 
 All derive the version, prove CI is green and render the notes the same way; only the publish differs. The steps
 were being copied into every `release.yml`; here they live once, and a consumer carries a ~12-line caller.
@@ -88,6 +92,93 @@ jobs:
 
 It also accepts `java-version` (default `25`) and `java-distribution` (default `temurin`).
 
+## Usage — Ekwi instances (Docker image)
+
+Two thin callers pointing at the **same** reusable: `release.yml` (real) and `ci.yml` (the PR gate, `dry-run`).
+
+Scanning is split: **dependencies (Composer/npm under `/app`) block** the build (fixable here), **base OS is
+report-only** (SARIF to the Security tab — needs `security-events: write`, best-effort). The dependency gate is
+scoped with `trivy-lib-skip-dirs` (default `usr/local`) so base-shipped language runtime (global npm, FrankenPHP's
+Go, PHP) is excluded — it is covered by docker-php's own scan, not the instance.
+
+`release.yml`:
+
+```yaml
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Release channel — pre-release cuts X.Y.Z-beta.N, latest cuts a stable X.Y.Z.'
+        required: true
+        default: pre-release
+        type: choice
+        options: [pre-release, latest]
+
+permissions: {}
+
+jobs:
+  release:
+    permissions:
+      contents: write         # create the tag + the GitHub Release
+      packages: write         # push the image to GHCR
+      actions: read           # the green gate reads CI conclusions
+      pull-requests: read     # release notes resolve each commit's PR
+      security-events: write  # upload the base OS Trivy report (SARIF) to the Security tab
+    uses: ekwi-tech/release-workflow/.github/workflows/docker-image-release-reusable.yml@<sha>   # pin by SHA
+    with:
+      channel: ${{ inputs.channel }}
+      initial-version: '0.1.0'
+      ci-workflows: 'ci.yml'
+      build-args: |
+        PHP_IMAGE_VERSION=4
+        DEFAULT_LOCALE=fr_FR
+        LOCALE_LIST=en_US fr_FR
+        TEMP_DIRECTORY=/app/var/tmp
+        VITE_PORT=5173
+      # self-hosted-registry: registry.ekwi.tech   # uncomment once it is up (dual-push; deploys pull from it)
+    secrets:
+      composer-auth: ${{ secrets.COMPOSER_AUTH }}
+      # dockerhub-user / dockerhub-token: optional, to lift the Docker Hub base-image rate limit
+      # registry-user / registry-token: required only when self-hosted-registry is set
+```
+
+`ci.yml` (PR gate — same reusable, `dry-run`, no push/release):
+
+```yaml
+name: CI
+on:
+  pull_request: { branches: [main] }
+  # Also on push to main: the release green gate needs a green ci.yml run on the EXACT release commit (a squash-merge
+  # mints a new SHA the PR run never covered). This dry-run build is that signal.
+  push: { branches: [main] }
+
+permissions: {}
+
+jobs:
+  build:
+    permissions:
+      contents: read
+      security-events: write  # upload the base OS Trivy report (SARIF); best-effort
+    uses: ekwi-tech/release-workflow/.github/workflows/docker-image-release-reusable.yml@<sha>   # pin by SHA
+    with:
+      channel: pre-release      # ignored under dry-run, but the input is required
+      dry-run: true
+      build-args: |
+        PHP_IMAGE_VERSION=4
+        DEFAULT_LOCALE=fr_FR
+        LOCALE_LIST=en_US fr_FR
+        TEMP_DIRECTORY=/app/var/tmp
+        VITE_PORT=5173
+    secrets:
+      composer-auth: ${{ secrets.COMPOSER_AUTH }}
+```
+
+Make **`CI / build / <reusable job name>`** a required check in the ruleset — mind the **three-segment** name, exactly
+as for Semantic Checks (select it from the detected-checks list, never type it). Docker-specific inputs beyond the
+shared table: `image-name` (defaults to `github.repository`), `dockerfile`, `build-target`, `build-args`, `platform`,
+`self-hosted-registry`, `trivy-severity`, `dry-run`.
+
 ## Usage — Conventional-Commit PR title (every repo)
 
 Replace the repo's whole `commitlint.yml` job with a thin caller. No inputs — the vocabulary is fixed on purpose,
@@ -127,11 +218,13 @@ changing any one silently stops the gate blocking.
 
 ## Requirements
 
-- The caller **must** grant `contents: write`, `actions: read`, `pull-requests: read` (see the snippets). The
-  reusable declares no permissions of its own and inherits the caller's grant — a reusable that asked for more
-  than the caller granted would fail at startup, so the grant lives with the caller, once. The tag-only workflow
-  needs no secrets — it uses only the automatic `GITHUB_TOKEN`; the Maven client additionally passes the
-  `packages-token` named secret shown above.
+- The caller **must** grant `contents: write`, `actions: read`, `pull-requests: read` (see the snippets); the
+  **Docker image** flow additionally needs `packages: write` (push to GHCR) and, for the base OS report,
+  `security-events: write` (SARIF upload; best-effort — a missing grant only skips the report). The reusable declares no permissions
+  of its own and inherits the caller's grant — a reusable that asked for more than the caller granted would fail at
+  startup, so the grant lives with the caller, once. The tag-only workflow needs no secrets — it uses only the
+  automatic `GITHUB_TOKEN`; the Maven client passes the `packages-token` named secret; the Docker image flow passes
+  `composer-auth` (required) and, optionally, `dockerhub-*` / `registry-*` (see that section).
 - The actions and this workflow are **public**, so any consumer — public or private — resolves them with no
   access setting (see *Why this is public* below).
 

@@ -1,0 +1,368 @@
+name: _Reusable — Docker image release
+
+# Reusable (workflow_call): release an Ekwi instance as a Docker image — build ekwi_prod, scan (Trivy), push to GHCR
+# (and an optional self-hosted registry), then cut the GitHub Release. The PR CI gate calls this same workflow with
+# dry-run: true (build + scan only, no version/gate/push/release), so the build logic lives once.
+on:
+  workflow_call:
+    inputs:
+      channel:
+        description: "pre-release (cuts X.Y.Z-beta.N) or latest (cuts a stable X.Y.Z). Forwarded from the caller's dispatch."
+        required: true
+        type: string
+      initial-version:
+        description: 'Version emitted for the very first release, when the repository has no tag yet.'
+        required: false
+        type: string
+        default: '0.1.0'
+      ci-workflows:
+        description: 'Space-separated workflow filenames that must have a successful run on the release commit — the green gate. Ignored under dry-run.'
+        required: false
+        type: string
+        default: ''
+      image-name:
+        description: 'Image path under the registry (owner/name). Defaults to the calling repository (github.repository).'
+        required: false
+        type: string
+        default: ''
+      dockerfile:
+        description: 'Path to the Dockerfile.'
+        required: false
+        type: string
+        default: 'docker/php/Dockerfile'
+      build-target:
+        description: 'Dockerfile stage to build and ship.'
+        required: false
+        type: string
+        default: 'ekwi_prod'
+      build-context:
+        description: 'Build context.'
+        required: false
+        type: string
+        default: '.'
+      build-args:
+        description: 'Extra NON-SECRET build args, one KEY=value per line (forwarded to buildx --build-arg).'
+        required: false
+        type: string
+        default: ''
+      platform:
+        description: 'Target platform (single — the image is --load-ed into the daemon so Trivy scans the exact bytes).'
+        required: false
+        type: string
+        default: 'linux/amd64'
+      ghcr-registry:
+        description: 'GHCR host.'
+        required: false
+        type: string
+        default: 'ghcr.io'
+      self-hosted-registry:
+        description: 'Optional self-hosted registry host (e.g. registry.ekwi.tech). When set, the image is ALSO pushed there (dual-push) and deployments pull from it. Empty = GHCR only.'
+        required: false
+        type: string
+        default: ''
+      trivy-severity:
+        description: 'Severities that fail the image scan.'
+        required: false
+        type: string
+        default: 'HIGH,CRITICAL'
+      trivy-lib-skip-dirs:
+        description: 'Dirs excluded from the dependency (library) gate — the base runtime under /usr/local (global npm, FrankenPHP, PHP) is not owned by the instance; app deps live under /app.'
+        required: false
+        type: string
+        default: 'usr/local'
+      dry-run:
+        description: 'Build and scan only — no version, no green gate, no push, no release. This is the PR CI gate mode.'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      composer-auth:
+        description: 'COMPOSER_AUTH JSON for reading private Composer packages at build (BuildKit secret), e.g. {"github-oauth":{"github.com":"<token>"}}.'
+        required: true
+      dockerhub-user:
+        description: 'Optional Docker Hub username to authenticate base-image pulls (ekwi/php) and lift the anonymous rate limit.'
+        required: false
+      dockerhub-token:
+        description: 'Optional Docker Hub token paired with dockerhub-user.'
+        required: false
+      registry-user:
+        description: 'Username for the self-hosted registry (required only when self-hosted-registry is set on a real run).'
+        required: false
+      registry-token:
+        description: 'Token/password for the self-hosted registry (required only when self-hosted-registry is set on a real run).'
+        required: false
+
+# Keyed on the calling workflow, not just the ref: the dry-run gate runs on `push: main` too, so keying on the ref
+# alone would share a group with a real release on `main` and serialise them. The gate cancels superseded runs; a
+# real release never cancels (an interrupted push could leave a tag without its image).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ inputs.dry-run }}
+
+jobs:
+  release:
+    name: Build the instance image, scan, push and release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30   # a full image build (composer + vite + pnpm) is heavier than tag-only; must not hang for hours
+    # NO job-level `permissions:` — inherited from the caller. Real callers grant contents:write + packages:write +
+    # actions:read + pull-requests:read; the dry-run gate grants read only.
+    steps:
+      # Fail loudly on a bad contract. Also emits flags so later `if:` conditions never read the `secrets` context.
+      - name: Validate inputs
+        id: validate
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          CI_WORKFLOWS: ${{ inputs.ci-workflows }}
+          INITIAL_VERSION: ${{ inputs.initial-version }}
+          DRY_RUN: ${{ inputs.dry-run }}
+          SELF_HOSTED: ${{ inputs.self-hosted-registry }}
+          DOCKERHUB_TOKEN: ${{ secrets.dockerhub-token }}
+          REGISTRY_TOKEN: ${{ secrets.registry-token }}
+        run: |
+          set -euo pipefail
+          case "${CHANNEL}" in
+            pre-release|latest) ;;
+            *) echo "::error::channel must be 'pre-release' or 'latest', got '${CHANNEL}'"; exit 1 ;;
+          esac
+          if ! printf '%s' "${INITIAL_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::initial-version must be X.Y.Z (no leading v), got '${INITIAL_VERSION}'"; exit 1
+          fi
+          if [ "${DRY_RUN}" != "true" ] && [ -z "${CI_WORKFLOWS// /}" ]; then
+            echo "::error::ci-workflows is empty — the green gate would pass without checking anything"; exit 1
+          fi
+          if [ -n "${SELF_HOSTED}" ] && [ "${DRY_RUN}" != "true" ] && [ -z "${REGISTRY_TOKEN}" ]; then
+            echo "::error::self-hosted-registry is set but the registry-token secret is missing"; exit 1
+          fi
+          echo "has-dockerhub=$([ -n "${DOCKERHUB_TOKEN}" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      # Real runs publish from main only. Skipped under dry-run: the gate runs on a PR branch.
+      - name: Refuse to release from a branch other than main
+        if: ${{ !inputs.dry-run }}
+        run: |
+          if [ "${GITHUB_REF_NAME}" != "main" ]; then
+            echo "::error::Releases are cut from main only — this run targets '${GITHUB_REF_NAME}'"; exit 1
+          fi
+
+      # fetch-depth: 0 — next-version-action and release-notes-action read every tag and the full commit graph.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve image path
+        id: img
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+        run: |
+          set -euo pipefail
+          name="${IMAGE_NAME:-$GITHUB_REPOSITORY}"
+          name="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"   # registries require lowercase paths
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute the next version
+        id: version
+        if: ${{ !inputs.dry-run }}
+        uses: ekwi-tech/next-version-action@6bc05ac16f2b8c1906710f3c6b462f6c26ad631f # v0.1.0
+        with:
+          prerelease: ${{ inputs.channel == 'pre-release' }}
+          initial-version: ${{ inputs.initial-version }}
+
+      - name: Refuse to overwrite an existing tag
+        if: ${{ !inputs.dry-run }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
+            echo "::error::Tag v${VERSION} already exists"; exit 1
+          fi
+
+      # "Green before ship." Gates on the caller-named CI workflows for THIS exact commit. Skipped under dry-run.
+      - name: Require a successful CI run on this commit
+        if: ${{ !inputs.dry-run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_WORKFLOWS: ${{ inputs.ci-workflows }}
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          for wf in ${CI_WORKFLOWS}; do
+            # Capture the body (2>&1) so an HTTP error is told apart from a legitimately-absent green run.
+            if ! runs="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?head_sha=${SHA}&per_page=100" 2>&1)"; then
+              case "$runs" in
+                *'HTTP 403'*) echo "::error::Cannot read Actions runs for '${wf}' — the caller must grant 'actions: read'" ;;
+                *'HTTP 404'*) echo "::error::Workflow '${wf}' not found — does .github/workflows/${wf} exist?" ;;
+                *)            echo "::error::Querying runs for '${wf}' failed: ${runs}" ;;
+              esac
+              exit 1
+            fi
+            green="$(printf '%s' "$runs" | jq '[.workflow_runs[] | select(.conclusion == "success")] | length')"
+            if [ "${green}" -eq 0 ]; then
+              running="$(printf '%s' "$runs" | jq '[.workflow_runs[] | select(.status != "completed")] | length')"
+              if [ "${running}" -gt 0 ]; then
+                echo "::error::'${wf}' is still running for ${SHA} — wait for it to go green, then re-dispatch"
+              else
+                echo "::error::No successful '${wf}' run for ${SHA} — refusing to release an untested commit"
+              fi
+              exit 1
+            fi
+            echo "  ${wf}: green for ${SHA}"
+          done
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      # Base images (ekwi/php:*) are on PUBLIC Docker Hub — authenticate ONLY if creds are provided, to lift the
+      # anonymous pull rate limit on busy CI. Anonymous still works for occasional builds.
+      - name: Log in to Docker Hub (base images)
+        if: ${{ steps.validate.outputs.has-dockerhub == 'true' }}
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        with:
+          username: ${{ secrets.dockerhub-user }}
+          password: ${{ secrets.dockerhub-token }}
+
+      - name: Log in to GHCR
+        if: ${{ !inputs.dry-run }}
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        with:
+          registry: ${{ inputs.ghcr-registry }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Log in to the self-hosted registry
+        if: ${{ !inputs.dry-run && inputs.self-hosted-registry != '' }}
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        with:
+          registry: ${{ inputs.self-hosted-registry }}
+          username: ${{ secrets.registry-user }}
+          password: ${{ secrets.registry-token }}
+
+      # Free disk on GitHub-hosted runners only: the image plus buildx layers plus Trivy's DBs can exhaust the
+      # ~14 GB runner (observed: Trivy's 897 MB Java DB hit "no space left"). Skipped on self-hosted (large disk;
+      # and a global rm on a shared host could hit concurrent jobs — isolation there comes from ephemeral runners).
+      - name: Free runner disk space (best-effort)
+        if: runner.environment == 'github-hosted'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          df -h / | tail -1 || true
+
+      # Build into the local daemon (--load) so Trivy scans the EXACT bytes before any push. Single platform by
+      # design (--load is single-arch; prod is amd64). The composer token is a BuildKit secret, never a layer.
+      - name: Build the image
+        id: build
+        env:
+          COMPOSER_AUTH: ${{ secrets.composer-auth }}
+          LOCAL_REF: local-ci/${{ steps.img.outputs.name }}:build-${{ github.sha }}
+          BUILD_ARGS: ${{ inputs.build-args }}
+        run: |
+          set -euo pipefail
+          args=()
+          while IFS= read -r line; do
+            [ -n "${line// /}" ] && args+=( --build-arg "${line}" )
+          done <<< "${BUILD_ARGS}"
+          docker buildx build \
+            --platform "${{ inputs.platform }}" \
+            --target "${{ inputs.build-target }}" \
+            --file "${{ inputs.dockerfile }}" \
+            --secret id=composer_auth,env=COMPOSER_AUTH \
+            "${args[@]}" \
+            --tag "${LOCAL_REF}" \
+            --load \
+            "${{ inputs.build-context }}"
+          echo "local-ref=${LOCAL_REF}" >> "$GITHUB_OUTPUT"
+
+      # Scanning follows "block where we can fix, report where we can't":
+      #   - OS packages (Debian) are gated upstream in docker-php and not fixable here → REPORT-only (SARIF).
+      #   - dependencies (Composer/npm under /app) are ours and fixable here → BLOCKING. The base runtime under
+      #     /usr/local (global npm, FrankenPHP's Go, PHP) is also `library`-typed but NOT ours — it is skip-dir'd
+      #     from the gate (see trivy-lib-skip-dirs) and covered by docker-php's own scan.
+      - name: Trivy — report base OS vulnerabilities (non-blocking)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.build.outputs.local-ref }}
+          scanners: vuln
+          vuln-type: os
+          severity: ${{ inputs.trivy-severity }}
+          ignore-unfixed: true
+          exit-code: '0'
+          format: sarif
+          output: trivy-os.sarif
+
+      # Best-effort: land the OS report in the Security tab for tracking (not "under the rug"). Requires the caller
+      # to grant `security-events: write`; continue-on-error keeps a missing grant from failing the build.
+      - name: Upload base OS report to the Security tab (best-effort)
+        if: ${{ hashFiles('trivy-os.sarif') != '' }}
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@4187e74d05793876e9989daffde9c3e66b4acd07 # v3
+        with:
+          sarif_file: trivy-os.sarif
+          category: trivy-os
+
+      - name: Trivy — fail on fixable HIGH/CRITICAL in dependencies
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.build.outputs.local-ref }}
+          scanners: vuln
+          vuln-type: library
+          skip-dirs: ${{ inputs.trivy-lib-skip-dirs }}
+          severity: ${{ inputs.trivy-severity }}
+          ignore-unfixed: true
+          exit-code: '1'
+          format: table
+
+      # Tag the SCANNED local image to the final refs and push. `:latest` tracks the last STABLE release only
+      # (a pre-release is reachable by its exact version tag, never promoted to latest).
+      - name: Push the image
+        if: ${{ !inputs.dry-run }}
+        env:
+          LOCAL_REF: ${{ steps.build.outputs.local-ref }}
+          NAME: ${{ steps.img.outputs.name }}
+          VERSION: ${{ steps.version.outputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+          GHCR: ${{ inputs.ghcr-registry }}
+          SELF_HOSTED: ${{ inputs.self-hosted-registry }}
+        run: |
+          set -euo pipefail
+          registries=("${GHCR}")
+          [ -n "${SELF_HOSTED}" ] && registries+=("${SELF_HOSTED}")
+          for reg in "${registries[@]}"; do
+            docker tag "${LOCAL_REF}" "${reg}/${NAME}:${VERSION}"
+            docker push "${reg}/${NAME}:${VERSION}"
+            echo "  pushed ${reg}/${NAME}:${VERSION}"
+            if [ "${CHANNEL}" = "latest" ]; then
+              docker tag "${LOCAL_REF}" "${reg}/${NAME}:latest"
+              docker push "${reg}/${NAME}:latest"
+              echo "  pushed ${reg}/${NAME}:latest"
+            fi
+          done
+
+      - name: Generate the release notes
+        id: notes
+        if: ${{ !inputs.dry-run }}
+        uses: ekwi-tech/release-notes-action@76488d0c9bf8a1d9a8d8677a536232a584bd5f41 # v0.1.0
+        with:
+          version: ${{ steps.version.outputs.version }}
+          token: ${{ github.token }}
+
+      # Publishing == creating the tag + Release; the image already sits in the registry under the same version. A
+      # hyphen in the version means pre-release, excluded from GitHub's "Latest".
+      - name: Publish the GitHub Release
+        if: ${{ !inputs.dry-run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          NOTES_FILE: ${{ steps.notes.outputs.notes-file }}
+        run: |
+          set -euo pipefail
+          prerelease_flag=""
+          case "$VERSION" in *-*) prerelease_flag="--prerelease" ;; esac
+          gh release create "v${VERSION}" \
+            --target "$(git rev-parse HEAD)" \
+            --title "${VERSION}" \
+            --notes-file "${NOTES_FILE}" \
+            $prerelease_flag
+
+      - name: Dry-run summary
+        if: ${{ inputs.dry-run }}
+        run: |
+          echo "::notice::[dry-run] image built (${{ steps.build.outputs.local-ref }}) and scanned — no version, no push, no release. CI gate OK."
