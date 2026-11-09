@@ -41,7 +41,10 @@ on:
         type: string
         default: '.'
       build-args:
-        description: 'Extra NON-SECRET build args, one KEY=value per line (forwarded to buildx --build-arg).'
+        description: >-
+          Extra NON-SECRET build args, one KEY=value per line (forwarded to buildx --build-arg). Do not hard-code
+          the base major here: a value copied from an example pins a base image the caller did not choose. The
+          README shows one way to read it from the calling repository.
         required: false
         type: string
         default: ''

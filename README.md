@@ -99,7 +99,21 @@ Two thin callers pointing at the **same** reusable: `release.yml` (real) and `ci
 Scanning is split: **dependencies (Composer/npm under `/app`) block** the build (fixable here), **base OS is
 report-only** (SARIF to the Security tab — needs `security-events: write`, best-effort). The dependency gate is
 scoped with `trivy-lib-skip-dirs` (default `usr/local`) so base-shipped language runtime (global npm, FrankenPHP's
-Go, PHP) is excluded — it is covered by docker-php's own scan, not the instance.
+Go, PHP) is excluded — it is covered by docker-php's own scan, not the instance. This split is transitional: a
+dated decision removes **both** passes from the instance image once the base-image gate covers the line that
+instance builds on, app dependencies moving to Dependabot on the committed lockfiles. That gate exists on the `5`
+line only, not on `4`, where most of the fleet still builds. Until it does, both passes stay.
+
+⚠ **Never hard-code the base major in `build-args`.** It is not uniform across the fleet — an instance in
+production runs an older one — so a value copied from this README builds against the wrong base image, then tags
+it, pushes it and lets the production overlay pull it, all on a green run. Both snippets read it in a job the
+calling repository owns. Where that job reads from is the caller's choice; the Ekwi fleet uses each instance's own
+`.env`. A value no instance decides, such as `TEMP_DIRECTORY`, stays a literal — the rule is about what differs.
+
+⚠ **These snippets assume the next-major Dockerfile of `instance-skeleton`**: the private-package token as a
+BuildKit secret, and no `VITE_PORT` build arg. On the `0.5` line, where most instances still are, that Dockerfile
+takes the token as an `ARG` — the build fails on the first private package whatever `build-args` carries, and
+`VITE_PORT` is still a build input there. Do not adopt this flow before an instance moves to that line.
 
 `release.yml`:
 
@@ -118,7 +132,37 @@ on:
 permissions: {}
 
 jobs:
+  build-inputs:
+    name: Read the build inputs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      build-args: ${{ steps.read.outputs.build-args }}
+    steps:
+      - uses: actions/checkout@<sha>   # pin by SHA
+        with:
+          persist-credentials: false
+      - name: Read the non-secret build inputs
+        id: read
+        run: |
+          set -euo pipefail
+          [ -f .env ] || { echo "::error::.env not found at the repository root"; exit 1; }
+          # An allow-list, not an exclusion: name what may leave this step, so a secret in the source cannot.
+          # DEFAULT_LOCALE and LOCALE_LIST are in no .env today; the Dockerfile's own ARG defaults then apply.
+          : > args
+          for k in PHP_IMAGE_VERSION DEFAULT_LOCALE LOCALE_LIST; do
+            # \r matters: a .env edited on Windows would otherwise make `FROM ekwi/php:4\r-builder`.
+            v="$(grep -m1 "^${k}=" .env | cut -d= -f2- | tr -d "\"'\r" || true)"
+            [ -n "${v}" ] && printf '%s=%s\n' "${k}" "${v}" >> args
+          done
+          printf 'TEMP_DIRECTORY=/app/var/tmp\n' >> args
+          # No safe default for the base major — refuse rather than build on the wrong line.
+          grep -q '^PHP_IMAGE_VERSION=' args || { echo "::error::PHP_IMAGE_VERSION is not set in .env"; exit 1; }
+          { echo 'build-args<<ARGS'; cat args; echo 'ARGS'; } >> "$GITHUB_OUTPUT"
+
   release:
+    needs: build-inputs
     permissions:
       contents: write         # create the tag + the GitHub Release
       packages: write         # push the image to GHCR
@@ -130,12 +174,7 @@ jobs:
       channel: ${{ inputs.channel }}
       initial-version: '0.1.0'
       ci-workflows: 'ci.yml'
-      build-args: |
-        PHP_IMAGE_VERSION=4
-        DEFAULT_LOCALE=fr_FR
-        LOCALE_LIST=en_US fr_FR
-        TEMP_DIRECTORY=/app/var/tmp
-        VITE_PORT=5173
+      build-args: ${{ needs.build-inputs.outputs.build-args }}
       # self-hosted-registry: registry.ekwi.tech   # uncomment once it is up (dual-push; deploys pull from it)
     secrets:
       composer-auth: ${{ secrets.COMPOSER_AUTH }}
@@ -143,7 +182,8 @@ jobs:
       # registry-user / registry-token: required only when self-hosted-registry is set
 ```
 
-`ci.yml` (PR gate — same reusable, `dry-run`, no push/release):
+`ci.yml` (PR gate — same reusable, `dry-run`, no push/release). It repeats `release.yml`'s `build-inputs` job
+verbatim — the gate must build on the arguments the release will use — and is shown here without it:
 
 ```yaml
 name: CI
@@ -156,7 +196,11 @@ on:
 permissions: {}
 
 jobs:
+  # build-inputs: copy the job from release.yml above, verbatim — the `needs` below names it, so this
+  # snippet does not validate on its own.
+
   build:
+    needs: build-inputs
     permissions:
       contents: read
       security-events: write  # upload the base OS Trivy report (SARIF); best-effort
@@ -164,20 +208,17 @@ jobs:
     with:
       channel: pre-release      # ignored under dry-run, but the input is required
       dry-run: true
-      build-args: |
-        PHP_IMAGE_VERSION=4
-        DEFAULT_LOCALE=fr_FR
-        LOCALE_LIST=en_US fr_FR
-        TEMP_DIRECTORY=/app/var/tmp
-        VITE_PORT=5173
+      build-args: ${{ needs.build-inputs.outputs.build-args }}
     secrets:
       composer-auth: ${{ secrets.COMPOSER_AUTH }}
 ```
 
-Make **`CI / build / <reusable job name>`** a required check in the ruleset — mind the **three-segment** name, exactly
-as for Semantic Checks (select it from the detected-checks list, never type it). Docker-specific inputs beyond the
-shared table: `image-name` (defaults to `github.repository`), `dockerfile`, `build-target`, `build-args`, `platform`,
-`self-hosted-registry`, `trivy-severity`, `dry-run`.
+Make **`build / <reusable job name>`** a required check in the ruleset — **two** segments, and see the naming rule
+under Semantic Checks below. Select it from the detected-checks list rather than typing it.
+
+Docker-specific inputs beyond the shared table: `image-name` (defaults to `github.repository`), `dockerfile`,
+`build-target`, `build-context`, `build-args`, `platform`, `ghcr-registry`, `self-hosted-registry`,
+`trivy-severity`, `trivy-lib-skip-dirs`.
 
 ## Usage — Conventional-Commit PR title (every repo)
 
@@ -200,12 +241,11 @@ jobs:
     uses: ekwi-tech/release-workflow/.github/workflows/commitlint-reusable.yml@<sha>   # pin by SHA
 ```
 
-**Make the check required** in the repo's ruleset — but mind the name. A reusable-workflow check is named on three
-segments: `<caller workflow name> / <caller job name> / <reusable job name>`, i.e. with the caller above
-`Semantic Checks / PR title / Conventional Commits on PR Title`. **Select it from the ruleset's detected-checks
-list** rather than typing it. For a fleet-uniform required check, keep all three stable across consumers — the
-caller workflow `name: Semantic Checks`, the job `name: PR title`, and (never reworded) the reusable's job name;
-changing any one silently stops the gate blocking.
+**Make the check required** in the repo's ruleset — but mind the name. A reusable-workflow check is named
+`<caller job name> / <reusable job name>`, and no workflow `name:` appears in it — measured on this repository's
+own check runs. With the caller above, that is `PR title / Conventional Commits on PR Title`. **Select it from the ruleset's detected-checks list** rather than
+typing it. For a fleet-uniform required check, keep both halves stable across consumers — the job
+`name: PR title` and (never reworded) the reusable's job name; changing either silently stops the gate blocking.
 
 ## Inputs (shared)
 
@@ -213,14 +253,17 @@ changing any one silently stops the gate blocking.
 |---|---|---|---|
 | `channel` | yes | — | `pre-release` (X.Y.Z-beta.N) or `latest` (stable X.Y.Z). Forward the caller's dispatch input. |
 | `initial-version` | no | `0.1.0` | Version for the very first release, when the repo has no tag yet. |
-| `ci-workflows` | yes | — | Space-separated workflow filenames that must have a successful run on the release commit (the green gate). |
-| `dry-run` | no | `false` | Run everything except tag/release creation — for a self-test. Also skips the main-branch and green-gate checks. |
+| `ci-workflows` | yes, except on a Docker dry-run, which skips the gate | — | Space-separated workflow filenames that must have a successful run on the release commit (the green gate). |
+| `dry-run` | no | `false` | Skip the publish — no tag, no Release — and the main-branch and green-gate checks with it. In the Docker flow it also skips the version and **the push**: build and scan only, which is the PR gate. |
 
 ## Requirements
 
-- The caller **must** grant `contents: write`, `actions: read`, `pull-requests: read` (see the snippets); the
-  **Docker image** flow additionally needs `packages: write` (push to GHCR) and, for the base OS report,
-  `security-events: write` (SARIF upload; best-effort — a missing grant only skips the report). The reusable declares no permissions
+- A **releasing** caller must grant `contents: write`, `actions: read`, `pull-requests: read` (see the snippets);
+  the **Docker image** flow additionally needs `packages: write` (push to GHCR) and, for the base OS report,
+  `security-events: write` (SARIF upload; best-effort — a missing grant only skips the report). A **dry-run gate**
+  grants `contents: read` and that same `security-events: write`, nothing more. ⚠ A Dependabot pull request is
+  not given the repository's secrets, and the Docker flow requires `composer-auth`: set that value as a
+  Dependabot secret too, or its dry-run cannot build. The reusable declares no permissions
   of its own and inherits the caller's grant — a reusable that asked for more than the caller granted would fail at
   startup, so the grant lives with the caller, once. The tag-only workflow needs no secrets — it uses only the
   automatic `GITHUB_TOKEN`; the Maven client passes the `packages-token` named secret; the Docker image flow passes
