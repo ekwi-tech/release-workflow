@@ -9,10 +9,10 @@ name: _Reusable — Conventional Commits on PR Title
 # correctness problem, not a style one, and it fails SILENTLY — a `feat` merged as "add the thing" is read as a
 # patch. Squash-merge makes the PR title the commit subject, so validating the title validates the commit.
 #
-# Make the resulting check REQUIRED in each consumer's ruleset. NOTE: a reusable-workflow check is named on THREE
-# load-bearing segments — "<caller workflow name> / <caller job name> / <this job's name>", here
-# "Semantic Checks / PR title / Conventional Commits on PR Title" (the shown "(pull_request)" is the event, not
-# the name). Pick it from the ruleset's detected list, don't type it; keep all three stable — reword none once required.
+# Make the resulting check REQUIRED in each consumer's ruleset. NOTE: the check is named
+# "<caller job name> / <this job's name>" — here "PR title / Conventional Commits on PR Title"; no workflow name
+# appears in it, and the shown "(pull_request)" is the event. Pick it from the ruleset's detected list, don't type
+# it; keep both halves stable — reword neither once required.
 on:
   workflow_call:
 
@@ -20,8 +20,8 @@ on:
 # at startup. The caller grants `pull-requests: read`, which the action reads through the automatic GITHUB_TOKEN.
 
 jobs:
-  # This `name:` is the last of those three segments (see the NOTE). Consumers set the first two — workflow
-  # "Semantic Checks" and job "PR title"; keep all three stable across the fleet, or rulesets break.
+  # This `name:` is the second segment (see the NOTE). Consumers set the first, the job `name: PR title`; keep
+  # both stable across the fleet, or rulesets break.
   validate-pr-title:
     name: Conventional Commits on PR Title
     runs-on: ubuntu-latest
