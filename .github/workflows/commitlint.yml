@@ -12,9 +12,9 @@ permissions: {}
 jobs:
   title:
     name: PR title
-    # Workflow name "Semantic Checks" + job name "PR title" + the reusable's job name make this repo's check
-    # "Semantic Checks / PR title / Conventional Commits on PR Title" — see commitlint-reusable.yml's NOTE. The
-    # caller grants the token scope; the reusable consumes GITHUB_TOKEN automatically.
+    # This job's name plus the reusable's make the check "PR title / Conventional Commits on PR Title" — the
+    # workflow name is not part of it; see commitlint-reusable.yml's NOTE. The caller grants the token scope;
+    # the reusable consumes GITHUB_TOKEN automatically.
     permissions:
       pull-requests: read
     uses: ./.github/workflows/commitlint-reusable.yml
