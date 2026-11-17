@@ -255,6 +255,18 @@ jobs:
           COMPOSER_AUTH: ${{ secrets.composer-auth }}
           LOCAL_REF: local-ci/${{ steps.img.outputs.name }}:build-${{ github.sha }}
           BUILD_ARGS: ${{ inputs.build-args }}
+          # `min` is the buildx default today; pinning it freezes the contract and keeps the 9 KB LLB graph
+          # that `max` adds out of the file. ⚠ It does NOT make the file secret-free: measured on buildx
+          # v0.30 / BuildKit v0.26, `min` writes every build-arg VALUE and every secret ID under
+          # `invocation.parameters`. Only `disabled` drops them — and it drops the materials too, which is the
+          # whole point here. ⚠ Not the same knob as BuildKit's `--provenance=mode=min`, which DOES scrub them
+          # from the attestation attached to the image. Check: `jq '.["buildx.build.provenance"].invocation
+          # .parameters | has("args")'` — without printing the value. So: never upload this file as an artifact,
+          # and never cat it into a log.
+          BUILDX_METADATA_PROVENANCE: min
+          # Outside the checkout: the workspace IS the default build context, and a caller with a permissive
+          # .dockerignore would COPY this file into a later image.
+          METADATA_FILE: ${{ runner.temp }}/build-metadata.json
         run: |
           set -euo pipefail
           args=()
@@ -268,9 +280,68 @@ jobs:
             --secret id=composer_auth,env=COMPOSER_AUTH \
             "${args[@]}" \
             --tag "${LOCAL_REF}" \
+            --metadata-file "${METADATA_FILE}" \
             --load \
             "${{ inputs.build-context }}"
           echo "local-ref=${LOCAL_REF}" >> "$GITHUB_OUTPUT"
+          echo "metadata-file=${METADATA_FILE}" >> "$GITHUB_OUTPUT"
+
+      # WHY: ekwi/php:${PHP_IMAGE_VERSION} is a MAJOR-line tag, re-published in place. Without recording which
+      # bytes it resolved to, an upstream base change is indistinguishable from a build defect. Read from
+      # buildx's own metadata, not from a second lookup of our own: a second lookup can disagree with the
+      # resolution the build actually used, which is the exact case this record exists to catch.
+      #
+      # Consultative only: it must never cost a build that succeeded, hence continue-on-error and the jq guard.
+      - name: Record the images by digest
+        continue-on-error: true
+        env:
+          BUILT_REF: ${{ steps.build.outputs.local-ref }}
+          METADATA_FILE: ${{ steps.build.outputs.metadata-file }}
+        run: |
+          # -e on purpose: `continue-on-error` already protects the build, so a broken jq must FAIL this step
+          # rather than print an empty digest under a green check. `// "none"` covers a missing key, not a
+          # broken tool.
+          set -euo pipefail
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::warning::jq not found — image digests were not recorded"
+            exit 0
+          fi
+          if [ ! -f "${METADATA_FILE}" ]; then
+            echo "::warning::build-metadata.json missing — image digests were not recorded"
+            exit 0
+          fi
+          {
+            echo "### Images by digest"
+            echo
+            echo "| role | reference | digest |"
+            echo "|---|---|---|"
+            # For the built target's graph only — an unreached stage's base does not appear.
+            # `materials` is the only shape this file can hold today: buildx normalises a v1 predicate with
+            # ConvertToSLSA02() before writing (build/provenance.go). The v1 branch below is a belt for the day
+            # that conversion goes away — it costs one `+` and never evaluates meanwhile. ⚠ A THIRD shape exists:
+            # multi-platform builds suffix the key (`buildx.build.provenance/linux/amd64`) and would read as
+            # empty. Out of reach while this workflow is single-platform by design (`--load` refuses a list).
+            jq -r '
+              ((.["buildx.build.provenance"].materials // [])
+               + (.["buildx.build.provenance"].buildDefinition.resolvedDependencies // []))
+              | [ .[] | select((.uri // "") | startswith("pkg:docker/")) ]
+              | if length == 0 then "| base | _no provenance material_ | |"
+                else .[] | "| base | `\(.uri)` | `sha256:\(.digest.sha256 // "")` |"
+                end
+            ' "${METADATA_FILE}"
+            # The local ref that was built and scanned, and the manifest buildx produced for it. ⚠ NOT the
+            # digest GHCR returns: the push recomposes the manifest from the daemon. When there is a push
+            # (never under dry-run), compare against the `digest:` line of that step, not against this one.
+            # Assigned, not inlined in printf: under `set -e` the status of a command substitution used as an
+            # argument is discarded, so a broken jq would print an empty cell under a green step.
+            built_digest=$(jq -r '."containerimage.digest" // "none"' "${METADATA_FILE}")
+            # shellcheck disable=SC2016  # the backticks are markdown code spans for the summary table,
+            # not a command substitution — single quotes are what keeps them literal.
+            printf '| **built** | `%s` | `%s` |\n' \
+              "${BUILT_REF}" "${built_digest}"
+            echo
+            echo "_\`built\` is the manifest buildx produced, not the digest the registry returns after push._"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # Scanning follows "block where we can fix, report where we can't":
       #   - OS packages (Debian) are gated upstream in docker-php and not fixable here → REPORT-only (SARIF).
