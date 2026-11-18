@@ -1,0 +1,13 @@
+# The second half of what a consumer's ruleset names. A reusable-workflow check is
+# `<caller job name> / <string below>` — the caller's job id only when that job has no `name:`.
+#
+# Moving one is a fleet-breaking change, not a rename: a consumer that made the check required stops seeing
+# it arrive, and its pull requests block with no signal from here. If you mean it, change it here too, and
+# tell the consumers.
+#
+# Format: <workflow file> <job name>, one per named job of every `workflow_call` workflow. Order is free —
+# the check sorts both sides. The CI diff prints the line to copy.
+commitlint-reusable.yml Conventional Commits on PR Title
+composer-release-reusable.yml Compute the version, prove CI green, tag and publish
+docker-image-release-reusable.yml Build the instance image, scan, push and release
+maven-sync-app-release-reusable.yml Build the deployable fat jar, tag and release

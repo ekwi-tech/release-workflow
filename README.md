@@ -248,8 +248,9 @@ jobs:
 **Make the check required** in the repo's ruleset — but mind the name. A reusable-workflow check is named
 `<caller job name> / <reusable job name>`, and no workflow `name:` appears in it — measured on this repository's
 own check runs. With the caller above, that is `PR title / Conventional Commits on PR Title`. **Select it from the ruleset's detected-checks list** rather than
-typing it. For a fleet-uniform required check, keep both halves stable across consumers — the job
-`name: PR title` and (never reworded) the reusable's job name; changing either silently stops the gate blocking.
+typing it. Both halves must then stay stable: if either moves, the check you made required **stops arriving**
+and your pull requests block. Our half is pinned in `.github/published-check-names.txt` and cannot move without
+failing our CI first. Yours — the caller's job `name:` — is pinned by nothing but you.
 
 ## Inputs (shared)
 

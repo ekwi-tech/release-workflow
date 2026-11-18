@@ -34,6 +34,31 @@ jobs:
         with:
           args: -color
 
+      # A reusable's job name is the second half of the check name a consumer's ruleset points at, so it is a
+      # public contract written inside a job. Pinned as text rather than reasoned about — deciding whether a
+      # rename 'really' changes anything is harder than the name. Selected by content, not by filename: a
+      # `workflow_call` file outside the *-reusable.yml convention publishes just as much.
+      - name: The published check names have not moved
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          export LC_ALL=C
+          : > "${RUNNER_TEMP}/actual"
+          for f in .github/workflows/*.yml .github/workflows/*.yaml; do
+            grep -qE '^  workflow_call:' "$f" || continue
+            b=$(basename "$f")
+            jobs=$(awk '/^jobs:/{f=1;next} /^[^ ]/{f=0} f && /^  [A-Za-z0-9_-]+:[[:space:]]*$/{n++} END{print n+0}' "$f")
+            # sed, not grep: a grep with no match exits 1 and would kill this step before the diff speaks.
+            named=$(sed -n "s|^    name: |${b} |p" "$f" | tee -a "${RUNNER_TEMP}/actual" | wc -l)
+            [ "${jobs}" -eq "${named}" ] \
+              || { echo "::error file=.github/workflows/${b}::${jobs} job(s), ${named} name(s) — an unnamed job publishes its id as a check name"; exit 1; }
+          done
+          sort -o "${RUNNER_TEMP}/actual" "${RUNNER_TEMP}/actual"
+          grep -v '^#' .github/published-check-names.txt | sort > "${RUNNER_TEMP}/pinned" || true
+          diff "${RUNNER_TEMP}/pinned" "${RUNNER_TEMP}/actual" && exit 0
+          echo "::error file=.github/published-check-names.txt::a published check name moved — update this file and tell the consumers, whose required check stops arriving and whose pull requests then block"
+          exit 1
+
   # Exercises the reusable workflow END TO END without cutting a real release: dry-run runs the version and notes
   # steps (the two wrapped actions, wired together) and skips the main-branch / green-gate / publish steps that
   # cannot hold on a PR. This is the composite of both actions proven, the same spirit as their own self-tests.
