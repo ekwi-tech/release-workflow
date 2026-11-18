@@ -1,8 +1,9 @@
 name: CI
 
-# Validates the reusable workflows: actionlint lints them all, and a dry-run self-test exercises the tag-only
-# (composer) one end to end. The Maven reusable is lint-only here — this repo has no Maven project to run it
-# against; it is proven by the first client that adopts it.
+# Validates what this repository publishes. actionlint covers the reusable workflows only — it parses any file
+# as a workflow, so it cannot read a composite action's metadata; the action is covered by its own self-test
+# below. A dry-run self-test exercises the tag-only (composer) reusable end to end; the Maven and Docker image
+# ones are lint-only here, proven by their first consumer.
 # Running on main is not redundant — release.yml refuses to publish a commit with no successful CI run against
 # its own SHA, and a squash merge mints a brand-new SHA the PR run never covered.
 on:
@@ -52,12 +53,120 @@ jobs:
       ci-workflows: ''      # unused: the green gate is skipped under dry-run
       dry-run: true
 
+  # The composite action has no consumer inside this repository, so nothing would otherwise exercise its
+  # decisions: the allow-list, the line anchor, first-assignment-wins, the \r stripping, the key-column
+  # anchor of the required-keys guard, and that each guard
+  # can fail on its own. ⚠ Only the OUTCOME of a failing step is read, never its message — the two error
+  # branches are not distinguished here. A fixture .env in RUNNER_TEMP, never the checkout: that is a build
+  # context for consumers.
+  action-self-test:
+    name: Exercise the read-build-inputs action
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Write the fixture
+        env:
+          FIXTURE: ${{ runner.temp }}/fixture.env
+        run: |
+          set -euo pipefail
+          # PHP_IMAGE_VERSION_EXTRA comes FIRST: a prefix match would take it and the assertion below would fail.
+          # The \r is deliberate, and SECRET_ISH must never reach the output.
+          {
+            printf 'PHP_IMAGE_VERSION_EXTRA=must-not-win\n'
+            printf '#PHP_IMAGE_VERSION=commented-must-not-win\n'
+            printf 'PHP_IMAGE_VERSION=5\r\n'
+            printf 'PHP_IMAGE_VERSION=duplicate-must-not-win\n'
+            printf 'DSN=db=host;port=5432\n'
+            printf 'QUOTED="fr_FR"\n'
+            printf 'EMPTY=\n'
+            printf 'SECRET_ISH=must-not-leak\n'
+          } > "${FIXTURE}"
+          # A second file that parses fine but lacks the required key — otherwise that guard would be proven
+          # by a missing file, which is a different branch.
+          # The value carries `PHP_IMAGE_VERSION=` on purpose: an unanchored guard would read it as the key being
+          # present, and de-anchoring would then go unnoticed — measured.
+          printf 'DSN=db=host;PHP_IMAGE_VERSION=9\n' > "${RUNNER_TEMP}/no-required.env"
+
+      - name: Read the fixture
+        id: read
+        uses: ./.github/actions/read-build-inputs
+        with:
+          keys: PHP_IMAGE_VERSION DSN QUOTED EMPTY
+          env-file: ${{ runner.temp }}/fixture.env
+
+      - name: The output is exactly what the fixture allows
+        env:
+          GOT: ${{ steps.read.outputs.build-args }}
+        run: |
+          set -euo pipefail
+          # printf rather than a heredoc: inside a YAML block scalar a heredoc keeps the block's indentation,
+          # and the comparison would fail on whitespace alone.
+          printf '%s\n' \
+            'PHP_IMAGE_VERSION=5' \
+            'DSN=db=host;port=5432' \
+            'QUOTED=fr_FR' \
+            'TEMP_DIRECTORY=/app/var/tmp' > "${RUNNER_TEMP}/want"
+          printf '%s\n' "${GOT}" > "${RUNNER_TEMP}/got"
+          diff "${RUNNER_TEMP}/want" "${RUNNER_TEMP}/got" && echo "output matches"
+
+      # Each failure path gets its own step: a single one would stop at the first and leave the rest unproven.
+      - name: Fail when keys is empty
+        id: empty-keys
+        continue-on-error: true
+        uses: ./.github/actions/read-build-inputs
+        with:
+          keys: '   '
+          # TEMP_DIRECTORY comes from constant-args, so the required-keys guard is satisfied and only the
+          # empty-keys guard can fail this step. With the default, removing that guard still exits 1 and the
+          # assertion stays green — measured.
+          required-keys: TEMP_DIRECTORY
+          env-file: ${{ runner.temp }}/fixture.env
+
+      - name: Fail when the file is missing
+        id: no-file
+        continue-on-error: true
+        uses: ./.github/actions/read-build-inputs
+        with:
+          keys: PHP_IMAGE_VERSION
+          env-file: ${{ runner.temp }}/absent.env
+
+      - name: Fail when a required key is not in the file
+        id: missing-in-file
+        continue-on-error: true
+        uses: ./.github/actions/read-build-inputs
+        with:
+          keys: DSN PHP_IMAGE_VERSION
+          required-keys: PHP_IMAGE_VERSION
+          env-file: ${{ runner.temp }}/no-required.env
+
+      - name: Fail when a required key is not in keys
+        id: missing-in-keys
+        continue-on-error: true
+        uses: ./.github/actions/read-build-inputs
+        with:
+          keys: DSN
+          required-keys: PHP_IMAGE_VERSION
+          env-file: ${{ runner.temp }}/fixture.env
+
+      - name: The four failure paths all failed
+        env:
+          OUTCOMES: ${{ steps.empty-keys.outcome }} ${{ steps.no-file.outcome }} ${{ steps.missing-in-file.outcome }} ${{ steps.missing-in-keys.outcome }}
+        run: |
+          set -euo pipefail
+          echo "outcomes: ${OUTCOMES}"
+          for o in ${OUTCOMES}; do
+            [ "${o}" = "failure" ] || { echo "::error::a guard did not fail (${OUTCOMES})"; exit 1; }
+          done
+
   # THE required status check, and the only one a ruleset should name. Every job above is a `needs:` here, so
   # adding one extends what "green" means without anyone touching the ruleset.
   ci-gate:
     name: CI gate
     if: always()
-    needs: [lint-workflows, self-test]
+    needs: [lint-workflows, self-test, action-self-test]
     runs-on: ubuntu-latest
     steps:
       - name: Every job must have succeeded

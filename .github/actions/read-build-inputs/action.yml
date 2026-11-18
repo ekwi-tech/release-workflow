@@ -1,0 +1,87 @@
+name: Read build inputs from .env
+description: >-
+  Reads an allow-list of NON-SECRET keys from a consumer's .env and emits them as build args.
+  The caller checks out its own repository first; this action only reads.
+  ⚠ Every value named here ends up in `--build-arg`, so it stays readable in the image's metadata and in
+  `docker history`. Name only what may be public.
+  Plain `KEY=value` lines only: a leading space, `export KEY=`, or a trailing `# comment` are not handled.
+
+inputs:
+  keys:
+    description: >-
+      Space-separated allow-list of .env keys to read. Required and without a default on purpose:
+      a .env may hold secrets, so what leaves this step is a decision each consumer makes and sees.
+    required: true
+  required-keys:
+    description: 'Space-separated keys that must end up in the output, or the step fails.'
+    required: false
+    default: PHP_IMAGE_VERSION
+  env-file:
+    description: 'Path to the file to read, relative to the workspace.'
+    required: false
+    default: .env
+  constant-args:
+    description: >-
+      Build args that are a property of the image layout rather than of the instance, appended after
+      the allow-list. One `KEY=value` per line.
+    required: false
+    default: TEMP_DIRECTORY=/app/var/tmp
+
+outputs:
+  build-args:
+    description: 'The build args, one `KEY=value` per line, ready for the reusable workflow input.'
+    value: ${{ steps.read.outputs.build-args }}
+
+runs:
+  using: composite
+  steps:
+    - name: Read the non-secret build inputs
+      id: read
+      shell: bash
+      env:
+        KEYS: ${{ inputs.keys }}
+        REQUIRED_KEYS: ${{ inputs.required-keys }}
+        ENV_FILE: ${{ inputs.env-file }}
+        CONSTANT_ARGS: ${{ inputs.constant-args }}
+      run: |
+        set -euo pipefail
+        # The key lists are split on whitespace, so globbing must be off: a `*` in `keys` would otherwise
+        # expand against the caller's checkout.
+        set -f
+
+        [ -n "$(printf '%s' "${KEYS}" | tr -d '[:space:]')" ] \
+          || { echo "::error::keys is empty — nothing would be read"; exit 1; }
+        [ -f "${ENV_FILE}" ] || { echo "::error::${ENV_FILE} not found"; exit 1; }
+
+        args="${RUNNER_TEMP}/build-args"   # not the checkout: it may be a build context
+        : > "${args}"
+        for k in ${KEYS}; do
+          # index()==1 rather than a regex: a key is a literal, and `A.B` must not match `A_B`.
+          # The first assignment wins, as a shell sourcing the file would take it.
+          # \r matters — a .env edited on Windows would otherwise make `FROM ekwi/php:4\r-builder`.
+          v="$(awk -v k="${k}" 'index($0, k "=") == 1 { sub(/^[^=]*=/, ""); print; exit }' "${ENV_FILE}" \
+               | tr -d "\"'\r")"
+          [ -n "${v}" ] && printf '%s=%s\n' "${k}" "${v}" >> "${args}"
+        done
+
+        while IFS= read -r line; do
+          [ -n "$(printf '%s' "${line}" | tr -d '[:space:]')" ] && printf '%s\n' "${line}" >> "${args}"
+        done <<< "${CONSTANT_ARGS}"
+
+        for k in ${REQUIRED_KEYS}; do
+          # On the key column only: unanchored, a value such as `DSN=x;PHP_IMAGE_VERSION=9` would satisfy
+          # the guard that exists to refuse building on the wrong line.
+          cut -d= -f1 "${args}" | grep -qxF -- "${k}" && continue
+          # Distinguish the two ways a required key goes missing, or the error sends the reader to the
+          # wrong file: it may simply not be in the allow-list.
+          case " ${KEYS} " in
+            *" ${k} "*) echo "::error::${k} is required but not set in ${ENV_FILE}" ;;
+            *)          echo "::error::${k} is required but absent from keys" ;;
+          esac
+          exit 1
+        done
+
+        # A random delimiter: a `constant-args` line equal to a fixed one would close the heredoc early and
+        # let the rest be read as arbitrary output assignments.
+        d="ARGS_${RANDOM}${RANDOM}"
+        { echo "build-args<<${d}"; cat "${args}"; echo "${d}"; } >> "$GITHUB_OUTPUT"

@@ -108,7 +108,21 @@ line only, not on `4`, where most of the fleet still builds. Until it does, both
 production runs an older one — so a value copied from this README builds against the wrong base image, then tags
 it, pushes it and lets the production overlay pull it, all on a green run. Both snippets read it in a job the
 calling repository owns. Where that job reads from is the caller's choice; the Ekwi fleet uses each instance's own
-`.env`. A value no instance decides, such as `TEMP_DIRECTORY`, stays a literal — the rule is about what differs.
+`.env`. A value no instance decides, such as `TEMP_DIRECTORY`, is a literal — it is the `constant-args` default of
+the action below, so it reaches the build without appearing in the snippet.
+
+The reading itself lives in a composite action of this repository, so a fix to the mechanism travels by a repin
+rather than by editing every consumer:
+
+| input | default | |
+|---|---|---|
+| `keys` | **none** | the allow-list. No default on purpose: a `.env` may hold secrets, so what leaves the step is each consumer's decision, stated where they can see it |
+| `required-keys` | `PHP_IMAGE_VERSION` | must end up in the output, or the step fails — no safe default for the base major |
+| `env-file` | `.env` | |
+| `constant-args` | `TEMP_DIRECTORY=/app/var/tmp` | properties of the image layout, not of the instance |
+
+⚠ Every value named in `keys` ends up in `--build-arg`, so it stays readable in the image's metadata and in
+`docker history`.
 
 ⚠ **These snippets assume the next-major Dockerfile of `instance-skeleton`**: the private-package token as a
 BuildKit secret, and no `VITE_PORT` build arg. On the `0.5` line, where most instances still are, that Dockerfile
@@ -143,23 +157,11 @@ jobs:
       - uses: actions/checkout@<sha>   # pin by SHA
         with:
           persist-credentials: false
-      - name: Read the non-secret build inputs
+      - uses: ekwi-tech/release-workflow/.github/actions/read-build-inputs@<sha>   # pin by SHA
         id: read
-        run: |
-          set -euo pipefail
-          [ -f .env ] || { echo "::error::.env not found at the repository root"; exit 1; }
-          # An allow-list, not an exclusion: name what may leave this step, so a secret in the source cannot.
+        with:
+          keys: PHP_IMAGE_VERSION DEFAULT_LOCALE LOCALE_LIST
           # DEFAULT_LOCALE and LOCALE_LIST are in no .env today; the Dockerfile's own ARG defaults then apply.
-          : > args
-          for k in PHP_IMAGE_VERSION DEFAULT_LOCALE LOCALE_LIST; do
-            # \r matters: a .env edited on Windows would otherwise make `FROM ekwi/php:4\r-builder`.
-            v="$(grep -m1 "^${k}=" .env | cut -d= -f2- | tr -d "\"'\r" || true)"
-            [ -n "${v}" ] && printf '%s=%s\n' "${k}" "${v}" >> args
-          done
-          printf 'TEMP_DIRECTORY=/app/var/tmp\n' >> args
-          # No safe default for the base major — refuse rather than build on the wrong line.
-          grep -q '^PHP_IMAGE_VERSION=' args || { echo "::error::PHP_IMAGE_VERSION is not set in .env"; exit 1; }
-          { echo 'build-args<<ARGS'; cat args; echo 'ARGS'; } >> "$GITHUB_OUTPUT"
 
   release:
     needs: build-inputs
@@ -182,8 +184,10 @@ jobs:
       # registry-user / registry-token: required only when self-hosted-registry is set
 ```
 
-`ci.yml` (PR gate — same reusable, `dry-run`, no push/release). It repeats `release.yml`'s `build-inputs` job
-verbatim — the gate must build on the arguments the release will use — and is shown here without it:
+`ci.yml` (PR gate — same reusable, `dry-run`, no push/release). It repeats `release.yml`'s `build-inputs` job,
+because the gate must build on the arguments the release will use. **The same `keys:` — not necessarily the same
+job:** the gate may add steps of its own, and `instance-skeleton` adds a `composer.lock` check there that has no
+place in a release. Shown here without that job:
 
 ```yaml
 name: CI
@@ -196,8 +200,8 @@ on:
 permissions: {}
 
 jobs:
-  # build-inputs: copy the job from release.yml above, verbatim — the `needs` below names it, so this
-  # snippet does not validate on its own.
+  # build-inputs: copy the job from release.yml above — the `needs` below names it, so this snippet does not
+  # validate on its own. Keep its `keys:` identical to the release's, or the gate builds on other arguments.
 
   build:
     needs: build-inputs
