@@ -13,9 +13,9 @@ where they can:
   manual). `ekwi-sync-common` is a multi-module library that *deploys* to the Maven registry — a different flow,
   kept bespoke rather than forced into a shared shape.
 - [`docker-image-release-reusable.yml`](./.github/workflows/docker-image-release-reusable.yml) — **Ekwi instances**:
-  build the per-instance application image (`ekwi_prod`), scan it (Trivy), push it to GHCR (and optionally a
+  build the per-instance application image (`ekwi_prod`), push it to GHCR (and optionally a
   self-hosted registry — dual-push), then cut the GitHub Release. The PR CI gate calls the **same** workflow with
-  `dry-run: true` (build + scan only), so the build logic lives once.
+  `dry-run: true` (build only), so the build logic lives once.
 
 All derive the version, prove CI is green and render the notes the same way; only the publish differs. The steps
 were being copied into every `release.yml`; here they live once, and a consumer carries a ~12-line caller.
@@ -96,13 +96,33 @@ It also accepts `java-version` (default `25`) and `java-distribution` (default `
 
 Two thin callers pointing at the **same** reusable: `release.yml` (real) and `ci.yml` (the PR gate, `dry-run`).
 
-Scanning is split: **dependencies (Composer/npm under `/app`) block** the build (fixable here), **base OS is
-report-only** (SARIF to the Security tab — needs `security-events: write`, best-effort). The dependency gate is
-scoped with `trivy-lib-skip-dirs` (default `usr/local`) so base-shipped language runtime (global npm, FrankenPHP's
-Go, PHP) is excluded — it is covered by docker-php's own scan, not the instance. This split is transitional: a
-dated decision removes **both** passes from the instance image once the base-image gate covers the line that
-instance builds on, app dependencies moving to Dependabot on the committed lockfiles. That gate exists on the `5`
-line only, not on `4`, where most of the fleet still builds. Until it does, both passes stay.
+**This flow does not scan the image.** A dated decision moves OS and base scanning upstream to the repository
+that owns the base — for `ekwi_prod` that is `ekwi/php`, and the gate lives on its `5` line only — and moves
+application dependencies to Dependabot on the committed, fully resolved `app/composer.lock` and
+`app/pnpm-lock.yaml`, which is what lets Dependabot see the tree actually shipped, transitive included.
+
+⚠ **This is about the instance image only.** The Maven reusable keeps its own scan: nothing downstream of the
+fat jar gates its dependencies, and the client repositories have no scanner of their own.
+
+**Know what this costs, in three parts.**
+
+1. **JS has no synchronous gate at ship time** any more, only Dependabot's asynchronous alert.
+   `roave/security-advisories` (require-dev) still blocks a known Composer advisory at resolution time, so
+   the PHP side keeps a gate; the JS side does not.
+2. **The OS surface stops being re-examined on the fleet's cadence.** The pass removed here ran on every
+   instance PR against a fresh vulnerability database. Upstream scanning runs *at base publication* and
+   never again — `docker-php` has no scheduled scan. A CVE disclosed after a base is published is seen by
+   nobody until the next base release.
+3. ⚠ **An instance on the `4` line has no OS gate at all**, upstream or here.
+
+⚠ **And check the precondition rather than assume it.** The upstream gate runs *at base publication*, so a
+base published before the gate landed has never been through it — and a pre-release run does not move a major
+tag. Compare the tag's `last_updated` with the date the gate merged before treating the hand-over as done:
+
+```bash
+curl -s https://hub.docker.com/v2/repositories/ekwi/php/tags/5 \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['last_updated'])"
+```
 
 ⚠ **Never hard-code the base major in `build-args`.** It is not uniform across the fleet — an instance in
 production runs an older one — so a value copied from this README builds against the wrong base image, then tags
@@ -170,7 +190,6 @@ jobs:
       packages: write         # push the image to GHCR
       actions: read           # the green gate reads CI conclusions
       pull-requests: read     # release notes resolve each commit's PR
-      security-events: write  # upload the base OS Trivy report (SARIF) to the Security tab
     uses: ekwi-tech/release-workflow/.github/workflows/docker-image-release-reusable.yml@<sha>   # pin by SHA
     with:
       channel: ${{ inputs.channel }}
@@ -209,7 +228,6 @@ jobs:
     needs: build-inputs
     permissions:
       contents: read
-      security-events: write  # upload the base OS Trivy report (SARIF); best-effort
     uses: ekwi-tech/release-workflow/.github/workflows/docker-image-release-reusable.yml@<sha>   # pin by SHA
     with:
       channel: pre-release      # ignored under dry-run, but the input is required
@@ -226,7 +244,7 @@ under Semantic Checks below. Select it from the detected-checks list rather than
 
 Docker-specific inputs beyond the shared table: `image-name` (defaults to `github.repository`), `dockerfile`,
 `build-target`, `build-context`, `build-args`, `base-image-pins`, `platform`, `ghcr-registry`,
-`self-hosted-registry`, `trivy-severity`, `trivy-lib-skip-dirs`.
+`self-hosted-registry`.
 
 ### Pinning the base images by digest
 
@@ -317,14 +335,14 @@ failing our CI first. Yours — the caller's job `name:` — is pinned by nothin
 | `channel` | yes | — | `pre-release` (X.Y.Z-beta.N) or `latest` (stable X.Y.Z). Forward the caller's dispatch input. |
 | `initial-version` | no | `0.1.0` | Version for the very first release, when the repo has no tag yet. |
 | `ci-workflows` | yes, except on a Docker dry-run, which skips the gate | — | Space-separated workflow filenames that must have a successful run on the release commit (the green gate). |
-| `dry-run` | no | `false` | Skip the publish — no tag, no Release — and the main-branch and green-gate checks with it. In the Docker flow it also skips the version and **the push**: build and scan only, which is the PR gate. |
+| `dry-run` | no | `false` | Skip the publish — no tag, no Release — and the main-branch and green-gate checks with it. In the Docker flow it also skips the version and **the push**: build only, which is the PR gate. |
 
 ## Requirements
 
 - A **releasing** caller must grant `contents: write`, `actions: read`, `pull-requests: read` (see the snippets);
-  the **Docker image** flow additionally needs `packages: write` (push to GHCR) and, for the base OS report,
-  `security-events: write` (SARIF upload; best-effort — a missing grant only skips the report). A **dry-run gate**
-  grants `contents: read` and that same `security-events: write`, nothing more. ⚠ A Dependabot pull request is
+  the **Docker image** flow additionally needs `packages: write` (push to GHCR). A **dry-run gate** grants
+  `contents: read`, nothing more. ⚠ `security-events: write` is no longer used by this flow: a caller still
+  granting it is giving a scope nothing consumes. ⚠ A Dependabot pull request is
   not given the repository's secrets, and the Docker flow requires `composer-auth`: set that value as a
   Dependabot secret too, or its dry-run cannot build. The reusable declares no permissions
   of its own and inherits the caller's grant — a reusable that asked for more than the caller granted would fail at
