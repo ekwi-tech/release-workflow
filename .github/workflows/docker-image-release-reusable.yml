@@ -70,7 +70,15 @@ on:
         type: string
         default: 'ghcr.io'
       self-hosted-registry:
-        description: 'Optional self-hosted registry host (e.g. registry.ekwi.tech). When set, the image is ALSO pushed there (dual-push) and deployments pull from it. Empty = GHCR only.'
+        description: 'Optional self-hosted registry host (e.g. registry.ekwi.tech). When set, the image goes to a second registry beside GHCR and deployments pull it under this name. Empty = GHCR only. See self-hosted-push-registry when writes use another name.'
+        required: false
+        type: string
+        default: ''
+      self-hosted-push-registry:
+        description: >-
+          Host to WRITE to, when it differs from the one deployments read from. Empty (the default) writes to
+          `self-hosted-registry`. A registry stores `<repository>:<tag>` and no host, so an image written by
+          one name is pulled by any other name serving the same registry — see the README.
         required: false
         type: string
         default: ''
@@ -90,10 +98,10 @@ on:
         description: 'Optional Docker Hub token paired with dockerhub-user.'
         required: false
       registry-user:
-        description: 'Username for the self-hosted registry (required only when self-hosted-registry is set on a real run).'
+        description: 'Username for the host that is WRITTEN to — self-hosted-push-registry when set, otherwise self-hosted-registry. Required only on a real run.'
         required: false
       registry-token:
-        description: 'Token/password for the self-hosted registry (required only when self-hosted-registry is set on a real run).'
+        description: 'Token/password for the host that is WRITTEN to. Required only when self-hosted-registry is set on a real run.'
         required: false
 
 # Keyed on the calling workflow, not just the ref: the dry-run gate runs on `push: main` too, so keying on the ref
@@ -121,6 +129,7 @@ jobs:
           INITIAL_VERSION: ${{ inputs.initial-version }}
           DRY_RUN: ${{ inputs.dry-run }}
           SELF_HOSTED: ${{ inputs.self-hosted-registry }}
+          SELF_HOSTED_PUSH: ${{ inputs.self-hosted-push-registry }}
           DOCKERHUB_TOKEN: ${{ secrets.dockerhub-token }}
           REGISTRY_TOKEN: ${{ secrets.registry-token }}
         run: |
@@ -137,6 +146,18 @@ jobs:
           fi
           if [ -n "${SELF_HOSTED}" ] && [ "${DRY_RUN}" != "true" ] && [ -z "${REGISTRY_TOKEN}" ]; then
             echo "::error::self-hosted-registry is set but the registry-token secret is missing"; exit 1
+          fi
+          if [ -n "${SELF_HOSTED_PUSH}" ]; then
+            [ -n "${SELF_HOSTED}" ] \
+              || { echo "::error::self-hosted-push-registry is set without self-hosted-registry — the dual-push is driven by the latter"; exit 1; }
+            # A bare lowercase name is not read as a host: measured, `docker pull registry/o/n:1` goes to
+            # Docker Hub while the login goes to the host named here. Shape first, then that rule.
+            printf '%s' "${SELF_HOSTED_PUSH}" | grep -qE '^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?$' \
+              || { echo "::error::self-hosted-push-registry '${SELF_HOSTED_PUSH}' is not a host — expected name or name:port, with no scheme and no path"; exit 1; }
+            case "${SELF_HOSTED_PUSH}" in
+              localhost|localhost:*|*.*|*:*) ;;
+              *) echo "::error::self-hosted-push-registry '${SELF_HOSTED_PUSH}' resolves to Docker Hub, not to a host — add the port (registry:5000) or use a dotted name"; exit 1 ;;
+            esac
           fi
           echo "has-dockerhub=$([ -n "${DOCKERHUB_TOKEN}" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
@@ -231,11 +252,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
+      # The credential belongs to the host we WRITE to, which may not be the one deployments read from.
       - name: Log in to the self-hosted registry
         if: ${{ !inputs.dry-run && inputs.self-hosted-registry != '' }}
         uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
         with:
-          registry: ${{ inputs.self-hosted-registry }}
+          registry: ${{ inputs.self-hosted-push-registry || inputs.self-hosted-registry }}
           username: ${{ secrets.registry-user }}
           password: ${{ secrets.registry-token }}
 
@@ -465,7 +487,6 @@ jobs:
           [ "${rc}" -eq 0 ] || exit 1
           echo "Every base of the built target was resolved through a pinned digest."
 
-      # `:latest` tracks the last STABLE release only — a pre-release stays reachable by its exact version.
       - name: Push the image
         if: ${{ !inputs.dry-run }}
         env:
@@ -475,20 +496,34 @@ jobs:
           CHANNEL: ${{ inputs.channel }}
           GHCR: ${{ inputs.ghcr-registry }}
           SELF_HOSTED: ${{ inputs.self-hosted-registry }}
+          SELF_HOSTED_PUSH: ${{ inputs.self-hosted-push-registry }}
         run: |
           set -euo pipefail
-          registries=("${GHCR}")
-          [ -n "${SELF_HOSTED}" ] && registries+=("${SELF_HOSTED}")
-          for reg in "${registries[@]}"; do
-            docker tag "${LOCAL_REF}" "${reg}/${NAME}:${VERSION}"
-            docker push "${reg}/${NAME}:${VERSION}"
-            echo "  pushed ${reg}/${NAME}:${VERSION}"
-            if [ "${CHANNEL}" = "latest" ]; then
-              docker tag "${LOCAL_REF}" "${reg}/${NAME}:latest"
-              docker push "${reg}/${NAME}:latest"
-              echo "  pushed ${reg}/${NAME}:latest"
-            fi
-          done
+          tags=("${VERSION}")
+          # `:latest` tracks the last STABLE release — a pre-release stays reachable by its exact version.
+          [ "${CHANNEL}" = "latest" ] && tags+=(latest)
+
+          # A registry stores `<repository>:<tag>` and no host, so what is written under one name is pulled
+          # under any name serving the same registry. The reference is built from the WRITE host; the pull
+          # host only labels the log, and the job never contacts it.
+          push_to() {
+            local write_host="$1" pull_host="$2" tag
+            for tag in "${tags[@]}"; do
+              docker tag "${LOCAL_REF}" "${write_host}/${NAME}:${tag}"
+              docker push "${write_host}/${NAME}:${tag}"
+              if [ "${write_host}" = "${pull_host}" ]; then
+                echo "  pushed ${write_host}/${NAME}:${tag}"
+              else
+                echo "  pushed ${write_host}/${NAME}:${tag} — pullable as ${pull_host}/${NAME}:${tag}"
+              fi
+            done
+          }
+
+          push_to "${GHCR}" "${GHCR}"
+          # An `if`, not `[ … ] && push_to …`: as the last command, a false test would exit the step 1.
+          if [ -n "${SELF_HOSTED}" ]; then
+            push_to "${SELF_HOSTED_PUSH:-${SELF_HOSTED}}" "${SELF_HOSTED}"
+          fi
 
       - name: Generate the release notes
         id: notes
