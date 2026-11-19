@@ -381,12 +381,154 @@ jobs:
             || { echo "::error::without the uri discriminant the typo fixture still fails (rc=${got}) — the assertion above proves nothing"; exit 1; }
           echo "ok   the discriminant is what refuses the typo case"
 
+  push-self-test:
+    name: Exercise the registry push path
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The steps are inline shell, so the test reads their own `run:` out of the YAML rather than keeping a
+      # second copy. A `docker` on PATH that only echoes turns the push step into comparable text.
+      - name: Extract the two steps, and stub docker
+        run: |
+          set -euo pipefail
+          python3 -c 'import yaml' || { echo "::error::PyYAML is needed here"; exit 1; }
+          python3 - <<'EXTRACT'
+          import os, pathlib, yaml
+          d = yaml.safe_load(open(".github/workflows/docker-image-release-reusable.yml"))
+          steps = d["jobs"]["release"]["steps"]
+          for name, out in (("Push the image", "push.sh"), ("Validate inputs", "validate.sh")):
+              step = next(s for s in steps if s.get("name") == name)
+              pathlib.Path(os.environ["RUNNER_TEMP"] + "/" + out).write_text(step["run"])
+          EXTRACT
+          mkdir -p "${RUNNER_TEMP}/stub"
+          printf '#!/bin/sh\necho "docker $*"\n' > "${RUNNER_TEMP}/stub/docker"
+          chmod +x "${RUNNER_TEMP}/stub/docker"
+
+      # Without the new input the step must do exactly what v0.2.0 did — the first line of #27's completion
+      # criteria, and nothing else in CI would notice it breaking.
+      # ⚠ The whole output is compared, not a count of lines. A count passes three mutations that break the
+      # feature, the fallback `${SELF_HOSTED_PUSH:-${SELF_HOSTED}}` among them: dropping it pushes
+      # `/o/n:1.2.3`, which is still one line — measured.
+      - name: Without a write host, the push is unchanged
+        env:
+          LOCAL_REF: l:b
+          NAME: o/n
+          VERSION: 1.2.3
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          export PATH="${RUNNER_TEMP}/stub:${PATH}"
+          fail=0
+          # printf, not a heredoc: inside a YAML block scalar a heredoc keeps the block's indentation and the
+          # comparison would fail on whitespace alone — the read-build-inputs self-test hit this first.
+          want() {
+            label="$1"; channel="$2"; self_hosted="$3"; shift 3
+            printf '%s\n' "$@" > "${RUNNER_TEMP}/want"
+            set +e
+            got=$(GHCR=ghcr.io SELF_HOSTED="${self_hosted}" SELF_HOSTED_PUSH="" CHANNEL="${channel}" bash push.sh 2>&1)
+            rc=$?
+            set -e
+            [ "${rc}" -eq 0 ] || { printf 'FAIL %-42s the step exited %s\n' "${label}" "${rc}"; fail=1; return; }
+            printf '%s\n' "${got}" | grep '^docker ' > "${RUNNER_TEMP}/got" || true
+            if diff -q "${RUNNER_TEMP}/want" "${RUNNER_TEMP}/got" >/dev/null; then
+              printf 'ok   %s\n' "${label}"
+            else
+              printf 'FAIL %s\n' "${label}"; diff "${RUNNER_TEMP}/want" "${RUNNER_TEMP}/got" || true; fail=1
+            fi
+          }
+          want "latest, GHCR only" latest "" \
+            'docker tag l:b ghcr.io/o/n:1.2.3' \
+            'docker push ghcr.io/o/n:1.2.3' \
+            'docker tag l:b ghcr.io/o/n:latest' \
+            'docker push ghcr.io/o/n:latest'
+          want "pre-release, GHCR only" pre-release "" \
+            'docker tag l:b ghcr.io/o/n:1.2.3' \
+            'docker push ghcr.io/o/n:1.2.3'
+          want "latest, dual-push" latest registry.ekwi.tech \
+            'docker tag l:b ghcr.io/o/n:1.2.3' \
+            'docker push ghcr.io/o/n:1.2.3' \
+            'docker tag l:b ghcr.io/o/n:latest' \
+            'docker push ghcr.io/o/n:latest' \
+            'docker tag l:b registry.ekwi.tech/o/n:1.2.3' \
+            'docker push registry.ekwi.tech/o/n:1.2.3' \
+            'docker tag l:b registry.ekwi.tech/o/n:latest' \
+            'docker push registry.ekwi.tech/o/n:latest'
+          want "pre-release, dual-push" pre-release registry.ekwi.tech \
+            'docker tag l:b ghcr.io/o/n:1.2.3' \
+            'docker push ghcr.io/o/n:1.2.3' \
+            'docker tag l:b registry.ekwi.tech/o/n:1.2.3' \
+            'docker push registry.ekwi.tech/o/n:1.2.3'
+          [ "${fail}" -eq 0 ] || { echo "::error::the push path changed for callers that set no write host"; exit 1; }
+
+      - name: With a write host, writes go there and the log names the pull host
+        env:
+          LOCAL_REF: l:b
+          NAME: o/n
+          VERSION: 1.2.3
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          export PATH="${RUNNER_TEMP}/stub:${PATH}"
+          out=$(GHCR=ghcr.io SELF_HOSTED=registry.ekwi.tech SELF_HOSTED_PUSH=registry:5000 CHANNEL=latest bash push.sh)
+          fail=0
+          has() { case "${out}" in *"$1"*) printf 'ok   %s\n' "$2" ;; *) printf 'FAIL %s\n' "$2"; fail=1 ;; esac; }
+          hasnt() { case "${out}" in *"$1"*) printf 'FAIL %s\n' "$2"; fail=1 ;; *) printf 'ok   %s\n' "$2" ;; esac; }
+          has   'docker push ghcr.io/o/n:1.2.3'                "GHCR still receives the image"
+          has   'docker push registry:5000/o/n:1.2.3'          "the write host receives the version"
+          has   'docker push registry:5000/o/n:latest'         "the write host receives latest"
+          has   'pullable as registry.ekwi.tech/o/n:1.2.3'     "the log names the pull host"
+          hasnt 'docker push registry.ekwi.tech'               "nothing is pushed to the pull host"
+          [ "${fail}" -eq 0 ] || { echo "::error::the split push path does not behave as specified"; exit 1; }
+
+      # The login expression is YAML, so no extracted shell reaches it — asserted as text instead.
+      - name: The login targets the write host
+        run: |
+          set -euo pipefail
+          python3 - <<'CHECK'
+          import yaml
+          d = yaml.safe_load(open(".github/workflows/docker-image-release-reusable.yml"))
+          step = next(s for s in d["jobs"]["release"]["steps"]
+                      if s.get("name") == "Log in to the self-hosted registry")
+          got = step["with"]["registry"]
+          # Assembled, never written literally: an expression delimiter in this file is read as a ci.yml
+          # expression by actionlint, which would then fail on inputs belonging to the other workflow.
+          want = "${" + "{ inputs.self-hosted-push-registry || inputs.self-hosted-registry }" + "}"
+          assert got == want, f"the self-hosted login targets {got!r}, not the write host"
+          print("ok   the login falls back from the write host to the pull host")
+          CHECK
+
+      - name: The guard refuses a write host that cannot work
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          fail=0
+          check() {
+            set +e
+            out=$(CHANNEL=latest CI_WORKFLOWS=ci.yml INITIAL_VERSION=0.1.0 DRY_RUN=true \
+                  SELF_HOSTED="$2" SELF_HOSTED_PUSH="$3" DOCKERHUB_TOKEN="" REGISTRY_TOKEN="" \
+                  GITHUB_OUTPUT=/dev/null bash validate.sh 2>&1)
+            got=$?
+            set -e
+            if [ "${got}" -eq "$1" ]; then printf 'ok   %-46s rc=%s\n' "$4" "${got}"
+            else printf 'FAIL %-46s rc=%s, wanted %s :: %s\n' "$4" "${got}" "$1" "${out}"; fail=1; fi
+          }
+          check 0 ""                   ""               "nothing set"
+          check 0 registry.ekwi.tech   ""               "pull host only, today's callers"
+          check 1 ""                   registry:5000    "a write host with no pull host"
+          check 1 registry.ekwi.tech   registry         "a bare name, which Docker sends to the Hub"
+          check 0 registry.ekwi.tech   registry:5000    "host:port"
+          check 0 registry.ekwi.tech   localhost        "localhost"
+          [ "${fail}" -eq 0 ] || { echo "::error::the write-host guard does not behave as specified"; exit 1; }
+
   # THE required status check, and the only one a ruleset should name. Every job above is a `needs:` here, so
   # adding one extends what "green" means without anyone touching the ruleset.
   ci-gate:
     name: CI gate
     if: always()
-    needs: [lint-workflows, self-test, action-self-test, pin-gate-self-test]
+    needs: [lint-workflows, self-test, action-self-test, pin-gate-self-test, push-self-test]
     runs-on: ubuntu-latest
     steps:
       - name: Every job must have succeeded

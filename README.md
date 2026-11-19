@@ -199,6 +199,7 @@ jobs:
       # base-image-pins: |        # the SAME list in both callers, and EVERY base — see "Pinning the
       #   …                        # base images by digest" below; a partial list fails the build
       # self-hosted-registry: registry.ekwi.tech   # uncomment once it is up (dual-push; deploys pull from it)
+      # self-hosted-push-registry: registry:5000   # only if writes go to a different name than reads
     secrets:
       composer-auth: ${{ secrets.COMPOSER_AUTH }}
       # dockerhub-user / dockerhub-token: optional, to lift the Docker Hub base-image rate limit
@@ -244,7 +245,39 @@ under Semantic Checks below. Select it from the detected-checks list rather than
 
 Docker-specific inputs beyond the shared table: `image-name` (defaults to `github.repository`), `dockerfile`,
 `build-target`, `build-context`, `build-args`, `base-image-pins`, `platform`, `ghcr-registry`,
-`self-hosted-registry`.
+`self-hosted-registry`, `self-hosted-push-registry`.
+
+### Writing and reading a registry under two names
+
+A self-hosted registry can answer to two names and accept writes on only one — the public name is served by
+an ingress that refuses `PUT POST PATCH DELETE` whatever the source, while the registry itself listens on its
+own network. `self-hosted-push-registry` names the host to **write** to:
+
+```yaml
+      self-hosted-registry: registry.ekwi.tech   # what deployments pull
+      self-hosted-push-registry: registry:5000   # what the runner writes to
+```
+
+The login, the tag and the push all use the write host. **A registry stores `<repository>:<tag>` and no
+host**, so the image written as `registry:5000/<name>:<version>` is the one pulled as
+`registry.ekwi.tech/<name>:<version>` — the two names serve the same registry. The run log prints the
+reference it pushed and the one it is pullable as; the job never contacts the second.
+
+Leaving the input empty writes to `self-hosted-registry`, which is what every caller does today.
+
+⚠ **The write host must look like a host to Docker.** A bare lowercase `registry` resolves to Docker Hub
+while the login goes to the host you named — measured. The run refuses it, refuses anything that is not
+`name` or `name:port` (no scheme, no path), and refuses a write host with no `self-hosted-registry` beside
+it.
+
+⚠ **Two things this input does not give you.** It is the **daemon** that pushes, so the daemon has to
+resolve the write host and accept it on plain HTTP where that applies — that side belongs to
+`ekwi-tech/tooling-infra#36`. And the runner is chosen **here**: this workflow is `runs-on: ubuntu-latest`,
+hard-coded, so until that changes you get a GitHub-hosted runner that resolves no internal name. Adding an
+input for it is not obviously enough — the same workflow serves the pull-request gate in `dry-run`, which
+has to stay away from the write path. *Reasoning, not measurement.*
+
+⚠ `registry-user` and `registry-token` are the credentials of the **write** host.
 
 ### Pinning the base images by digest
 
