@@ -3,7 +3,9 @@ name: CI
 # Validates what this repository publishes. actionlint covers the reusable workflows only — it parses any file
 # as a workflow, so it cannot read a composite action's metadata; the action is covered by its own self-test
 # below. A dry-run self-test exercises the tag-only (composer) reusable end to end; the Maven and Docker image
-# ones are lint-only here, proven by their first consumer.
+# ones are lint-only here, proven by their first consumer — except the Docker image reusable's base-image pin
+# gate, which has its own job: "proven by its first consumer" cannot cover a gate whose whole job is to refuse,
+# since a green consumer proves nothing about what the gate would have caught.
 # Running on main is not redundant — release.yml refuses to publish a commit with no successful CI run against
 # its own SHA, and a squash merge mints a brand-new SHA the PR run never covered.
 on:
@@ -186,12 +188,208 @@ jobs:
             [ "${o}" = "failure" ] || { echo "::error::a guard did not fail (${OUTCOMES})"; exit 1; }
           done
 
+  pin-gate-self-test:
+    name: Exercise the base-image pin gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Both steps live inline in the reusable, and they have to: `uses: ./…` inside a reusable workflow
+      # resolves against the CALLER's checkout, not this repository. So the test reads their own `run:` out
+      # of the YAML rather than keeping a second copy — a copy would drift, and a drifted copy would pass.
+      - name: Extract the two steps from the reusable
+        run: |
+          set -euo pipefail
+          python3 -c 'import yaml' \
+            || { echo "::error::PyYAML is needed to read the steps out of the workflow"; exit 1; }
+          python3 - <<'EXTRACT'
+          import os, pathlib, yaml
+          d = yaml.safe_load(open(".github/workflows/docker-image-release-reusable.yml"))
+          steps = d["jobs"]["release"]["steps"]
+          for name, out in (("Compose the base-image pins", "compose.sh"), ("Verify every base was pinned", "gate.sh")):
+              step = next(s for s in steps if s.get("name") == name)
+              pathlib.Path(os.environ["RUNNER_TEMP"] + "/" + out).write_text(step["run"])
+          EXTRACT
+
+      # The writer is tested too, not just the gate: the two sides share a file format, and a writer that
+      # drifted from it would leave the gate's fixtures green while refusing every real build.
+      - name: The pin writer accepts and refuses what it claims
+        env:
+          A: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          fail=0
+          compose() {
+            BASE_IMAGE_PINS="$1" PIN_ARGS_FILE="${RUNNER_TEMP}/args" PINS_FILE="${RUNNER_TEMP}/pins" \
+              GITHUB_OUTPUT="${RUNNER_TEMP}/ignored-output" bash compose.sh 2>&1
+          }
+          ok() { printf 'ok   %s\n' "$1"; }
+          ko() { printf 'FAIL %s :: %s\n' "$1" "$2"; fail=1; }
+
+          # Accepted, and the two files say exactly what the gate and buildx expect.
+          compose "ekwi/php:5-builder=sha256:${A}" >/dev/null
+          printf -- '--build-context\nekwi/php:5-builder=docker-image://ekwi/php:5-builder@sha256:%s\n' "${A}" > want-args
+          printf 'ekwi/php@5-builder %s\n' "${A}" > want-pins
+          check() { if diff -q "$1" "$2" >/dev/null; then ok "$3"; else ko "$3" "$(cat "$2")"; fi; }
+          check want-args args "a namespaced ref with a tag writes both files"
+          check want-pins pins "the purl key puts the tag after @"
+
+          # A ref with no tag keeps its key as is — buildx writes no `@` for it.
+          compose "alpine=sha256:${A}" >/dev/null
+          printf 'alpine %s\n' "${A}" > want-pins
+          check want-pins pins "a ref with no tag keeps its bare key"
+
+          # A CR from a file edited on Windows must not become part of the digest.
+          compose "$(printf 'ekwi/php:5=sha256:%s\r' "${A}")" >/dev/null
+          printf 'ekwi/php@5 %s\n' "${A}" > want-pins
+          check want-pins pins "a trailing CR is stripped"
+
+          # Blank and whitespace-only lines are skipped, not written as empty pins.
+          compose "$(printf '\n   \nekwi/php:5=sha256:%s\n\n' "${A}")" >/dev/null
+          if [ "$(wc -l < pins)" -eq 1 ]; then ok "blank lines are skipped"; else ko "blank lines are skipped" "$(cat pins)"; fi
+
+          # Each refusal, one per line, with the message asserted — several share an exit code.
+          refuse() {
+            set +e; out=$(compose "$1"); rc=$?; set -e
+            case "${rc}:${out}" in
+              1:*"expected <ref>=sha256:"*) ok "$2" ;;
+              *) ko "$2" "rc=${rc} ${out}" ;;
+            esac
+          }
+          refuse "ekwi/php:5=sha256:deadbeef"                        "a truncated digest is refused"
+          refuse "ekwi/php:5=$(printf 'sha256:%s' "${A}" | tr a A)"  "an UPPERCASE digest is refused"
+          refuse "ekwi/php:5=${A}"                                   "a digest without the sha256: prefix is refused"
+          refuse "ekwi/php:5"                                        "a line with no = is refused"
+
+          [ "${fail}" -eq 0 ] || { echo "::error::the pin writer does not behave as specified"; exit 1; }
+
+      # Fixtures rather than builds: the gate's whole input is a metadata file and a digest list, so every
+      # branch is reachable — including shapes a build on this runner would not produce.
+      # ⚠ They freeze buildx's purl format as measured on v0.30.1 / BuildKit v0.26.2, replayed on v0.34.2.
+      # If buildx changes it, these stay green while the real gate refuses every build: re-measure here first.
+      - name: Write the fixtures
+        env:
+          A: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          B: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          printf 'ekwi/php@5 %s\ndocker/dockerfile@1.10 %s\n' "${A}" "${A}" > pins.txt
+          mat() { printf '{"uri":"pkg:docker/%s","digest":{"sha256":"%s"}}' "$1" "$2"; }
+          prov() { printf '{"buildx.build.provenance":{"materials":[%s]}}\n' "$1"; }
+
+          prov "$(mat "ekwi/php@5?digest=sha256:${A}&platform=linux%2Famd64" "${A}")" > md-pinned.json
+          # The typo case: the key matched no FROM, so the base came through its TAG — and its digest is the
+          # SAME one the pins list, because that is where the digest was read from. Values alone pass this.
+          prov "$(mat "ekwi/php@5?platform=linux%2Famd64" "${A}")" > md-typo.json
+          # The `# syntax=` frontend, as the skeleton's Dockerfile produces it: no platform, and a material
+          # like any other. Pinning only the FROM lines leaves this one through its tag.
+          prov "$(mat "docker/dockerfile@1.10" "${A}")" > md-frontend.json
+          prov "$(mat "docker/dockerfile@1.10?digest=sha256:${A}" "${A}")" > md-frontend-pinned.json
+          # Pinned, but to a digest nobody listed.
+          prov "$(mat "ekwi/php@5?digest=sha256:${B}&platform=linux%2Famd64" "${B}")" > md-unpinned.json
+          # A listed digest, but under another key: the pair is what refuses it.
+          prov "$(mat "other/img@1?digest=sha256:${A}&platform=linux%2Famd64" "${A}")" > md-wrongkey.json
+          # A material with no digest, ALONGSIDE a good one. Alone it would be caught by the empty guard
+          # instead, and the assertion would pass whatever the jq fallback does — measured.
+          printf '{"buildx.build.provenance":{"materials":[%s,{"uri":"pkg:docker/ekwi/php@5?digest=sha256:%s"}]}}\n' \
+            "$(mat "ekwi/php@5?digest=sha256:${A}&platform=linux%2Famd64" "${A}")" "${A}" > md-nodigest.json
+          # Two bases, one pinned and one through its tag — the realistic shape.
+          printf '{"buildx.build.provenance":{"materials":[%s,%s]}}\n' \
+            "$(mat "ekwi/php@5?digest=sha256:${A}&platform=linux%2Famd64" "${A}")" \
+            "$(mat "ekwi/php@5-builder?platform=linux%2Famd64" "${A}")" > md-mixed.json
+          # The multi-platform shape: the provenance key is suffixed, so nothing is found.
+          printf '{"buildx.build.provenance/linux/amd64":{"materials":[%s]}}\n' \
+            "$(mat "ekwi/php@5?digest=sha256:${A}" "${A}")" > md-multi.json
+          # The SLSA v1 branch. buildx normalises to `materials` today, so no real build reaches it — it is
+          # a belt, and an untested belt is a guess.
+          printf '{"buildx.build.provenance":{"buildDefinition":{"resolvedDependencies":[%s]}}}\n' \
+            "$(mat "ekwi/php@5?digest=sha256:${A}&platform=linux%2Famd64" "${A}")" > md-v1-pinned.json
+          printf '{"buildx.build.provenance":{"buildDefinition":{"resolvedDependencies":[%s]}}}\n' \
+            "$(mat "ekwi/php@5?platform=linux%2Famd64" "${A}")" > md-v1-typo.json
+
+      - name: Every failure path is reached, and the nominal one passes
+        env:
+          PINS_FILE: ${{ runner.temp }}/pins.txt
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          fail=0
+          # ⚠ The MESSAGE is asserted, not only the exit code: several branches exit 1, and an assertion that
+          # reads the code alone passes for the wrong reason — measured on the no-digest fixture, which was
+          # caught by the empty guard rather than by the sentinel it claimed to prove.
+          expect() {
+            want="$1"; file="$2"; frag="$3"; label="$4"
+            set +e
+            out=$(METADATA_FILE="${RUNNER_TEMP}/${file}" PINS_FILE="${PINS_FILE}" bash gate.sh 2>&1)
+            got=$?
+            set -e
+            if [ "${got}" -ne "${want}" ]; then
+              printf 'FAIL %-50s rc=%s, wanted %s\n' "${label}" "${got}" "${want}"; fail=1; return
+            fi
+            case "${out}" in
+              *"${frag}"*) printf 'ok   %-50s rc=%s\n' "${label}" "${got}" ;;
+              *) printf 'FAIL %-50s rc=%s but message was %s\n' "${label}" "${got}" "${out}"; fail=1 ;;
+            esac
+          }
+          expect 0 md-pinned.json          "was resolved through a pinned digest" "a pinned base passes"
+          expect 1 md-typo.json            "resolved through its TAG"             "a base resolved through its tag is refused"
+          expect 1 md-frontend.json        "# syntax="                            "an unpinned syntax frontend is refused, and named"
+          expect 0 md-frontend-pinned.json "was resolved through a pinned digest" "a pinned syntax frontend passes"
+          expect 1 md-unpinned.json        "does not list for"                    "a digest absent from the list is refused"
+          expect 1 md-wrongkey.json        "does not list for"                    "a listed digest under another key is refused"
+          expect 1 md-nodigest.json        "does not list for"                    "a material with no digest is refused"
+          expect 1 md-mixed.json           "resolved through its TAG"             "one unpinned base among two is refused"
+          expect 1 md-multi.json           "no base image in the provenance"      "an unknown provenance shape is refused"
+          expect 0 md-v1-pinned.json       "was resolved through a pinned digest" "the SLSA v1 shape is read"
+          expect 1 md-v1-typo.json         "resolved through its TAG"             "the SLSA v1 shape is also gated"
+          expect 1 absent.json             "is missing"                           "a missing metadata file is refused"
+
+          # The second member of the file guard, which no fixture above touches.
+          set +e
+          out=$(METADATA_FILE="${RUNNER_TEMP}/md-pinned.json" PINS_FILE="${RUNNER_TEMP}/absent.txt" bash gate.sh 2>&1)
+          got=$?
+          set -e
+          case "${got}:${out}" in
+            1:*"is missing"*) printf 'ok   %-50s rc=1\n' "a missing pins file is refused" ;;
+            *) printf 'FAIL %-50s rc=%s %s\n' "a missing pins file is refused" "${got}" "${out}"; fail=1 ;;
+          esac
+
+          [ "${fail}" -eq 0 ] || { echo "::error::the pin gate does not behave as specified"; exit 1; }
+
+      # Anti-vacuity, as the read-build-inputs self-test proves its own guards: strip the one check that does
+      # the work, and the typo fixture must go GREEN again.
+      - name: Removing the discriminant must break the typo case
+        env:
+          PINS_FILE: ${{ runner.temp }}/pins.txt
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          python3 - <<'STRIP'
+          import os, pathlib, re
+          p = pathlib.Path(os.environ["RUNNER_TEMP"] + "/gate.sh")
+          s = p.read_text()
+          out = re.sub(r'\n[ ]*case "\$\{uri\}" in\n.*?\n[ ]*esac\n', "\n", s, flags=re.S)
+          assert out != s, "the uri discriminant was not found — this test no longer tests anything"
+          pathlib.Path(os.environ["RUNNER_TEMP"] + "/gate-nocheck.sh").write_text(out)
+          STRIP
+          set +e
+          METADATA_FILE="${RUNNER_TEMP}/md-typo.json" PINS_FILE="${PINS_FILE}" bash gate-nocheck.sh >/dev/null 2>&1
+          got=$?
+          set -e
+          [ "${got}" -eq 0 ] \
+            || { echo "::error::without the uri discriminant the typo fixture still fails (rc=${got}) — the assertion above proves nothing"; exit 1; }
+          echo "ok   the discriminant is what refuses the typo case"
+
   # THE required status check, and the only one a ruleset should name. Every job above is a `needs:` here, so
   # adding one extends what "green" means without anyone touching the ruleset.
   ci-gate:
     name: CI gate
     if: always()
-    needs: [lint-workflows, self-test, action-self-test]
+    needs: [lint-workflows, self-test, action-self-test, pin-gate-self-test]
     runs-on: ubuntu-latest
     steps:
       - name: Every job must have succeeded

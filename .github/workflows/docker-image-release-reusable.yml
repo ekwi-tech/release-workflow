@@ -48,6 +48,17 @@ on:
         required: false
         type: string
         default: ''
+      base-image-pins:
+        description: >-
+          Base images to pin by digest, one `<ref>=sha256:<64 lowercase hex>` per line. The ref is the FROM
+          line AFTER the ARG expansion — `ekwi/php:5-builder`, not `ekwi/php:${PHP_IMAGE_VERSION}-builder`.
+          Empty (the default) changes nothing. When set it is ENFORCED: every base of the built target must
+          have been resolved through one of these digests, or the build fails — see the gate step for why
+          that check is not optional. The README shows how to read a digest and why both callers need the
+          same list.
+        required: false
+        type: string
+        default: ''
       platform:
         description: 'Target platform (single — the image is --load-ed into the daemon so Trivy scans the exact bytes).'
         required: false
@@ -249,12 +260,68 @@ jobs:
 
       # Build into the local daemon (--load) so Trivy scans the EXACT bytes before any push. Single platform by
       # design (--load is single-arch; prod is amd64). The composer token is a BuildKit secret, never a layer.
+      # Separate from the build on purpose: this step is pure text, so the self-test in ci.yml extracts it and
+      # runs it, exactly as it does the gate. Inline, its branches were unreachable — and the registry-port
+      # branch nobody could reach was the proof that an untested decision is a guess.
+      #
+      # Each pin becomes a named build context keyed on the resolved FROM reference. Measured on buildx
+      # v0.30.1 / BuildKit v0.26.2: the key is matched AFTER the ARG expansion, so `ekwi/php:5-builder`
+      # substitutes `FROM ekwi/php:${PHP_IMAGE_VERSION}-builder`, and the literal `${…}` form is rejected
+      # outright (`invalid context name`).
+      - name: Compose the base-image pins
+        id: pins
+        if: inputs.base-image-pins != ''
+        env:
+          BASE_IMAGE_PINS: ${{ inputs.base-image-pins }}
+          # Outside the checkout, like the metadata file: the workspace IS the default build context, and a
+          # caller with a permissive .dockerignore would COPY these into a later image.
+          PIN_ARGS_FILE: ${{ runner.temp }}/pin-build-contexts
+          PINS_FILE: ${{ runner.temp }}/pinned-base-digests
+        run: |
+          set -euo pipefail
+          : > "${PIN_ARGS_FILE}"
+          : > "${PINS_FILE}"
+          while IFS= read -r line; do
+            [ -n "$(printf '%s' "${line}" | tr -d '[:space:]')" ] || continue
+            # \r: the digests are meant to live in a file the consumer owns, and one edited on Windows would
+            # make the digest 65 characters. The composite .env reader strips it for the same reason.
+            line="$(printf '%s' "${line}" | tr -d '\r')"
+            ref="${line%%=*}"
+            digest="${line#*=}"
+            # The full shape, not just the length: an UPPERCASE digest copied from a registry UI has 64
+            # characters, would pass a length check, and then fail inside buildx on `invalid checksum digest
+            # format` — later and further from the cause, which is what this guard exists to avoid.
+            printf '%s' "${digest}" | grep -qE '^sha256:[0-9a-f]{64}$' \
+              || { echo "::error::base-image-pins: '${line}' — expected <ref>=sha256:<64 lowercase hex>"; exit 1; }
+            # The TAG IS KEPT in the digest reference. Measured: `docker-image://img:tag@sha256:…` resolves,
+            # and the provenance then writes `pkg:docker/img@tag?digest=…`, tag included. A first version
+            # stripped it, which made the pinned purl tagless and the check below coarser than it needs to be.
+            printf -- '--build-context\n%s=docker-image://%s@%s\n' "${ref}" "${ref}" "${digest}" >> "${PIN_ARGS_FILE}"
+            # The purl key buildx will write for this ref: the tag goes after `@`, not `:`. Pairing the key
+            # with the digest makes the gate a CONSISTENCY check — did the build resolve each base to the
+            # digest we asked for it. ⚠ It is not, and cannot be, a check that the LIST is right: two digests
+            # swapped between `ekwi/php:5` and `ekwi/php:5-builder` are obeyed to the letter and pass.
+            # Measured. A digest belonging to a different image does not get that far — buildx fails to pull
+            # it, before the gate.
+            # ⚠ A registry with a PORT is out of scope: buildx percent-encodes it (`localhost%3A5000/img`),
+            # so this key would never match and the build would be refused. Short and namespaced Docker Hub
+            # names are what the fleet uses.
+            key="${ref}"
+            case "${ref##*/}" in *:*) key="${ref%:*}@${ref##*:}" ;; esac
+            printf '%s %s\n' "${key}" "${digest#sha256:}" >> "${PINS_FILE}"
+          done <<< "${BASE_IMAGE_PINS}"
+          {
+            echo "args-file=${PIN_ARGS_FILE}"
+            echo "pins-file=${PINS_FILE}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build the image
         id: build
         env:
           COMPOSER_AUTH: ${{ secrets.composer-auth }}
           LOCAL_REF: local-ci/${{ steps.img.outputs.name }}:build-${{ github.sha }}
           BUILD_ARGS: ${{ inputs.build-args }}
+          PIN_ARGS_FILE: ${{ steps.pins.outputs.args-file }}
           # `min` is the buildx default today; pinning it freezes the contract and keeps the 9 KB LLB graph
           # that `max` adds out of the file. ⚠ It does NOT make the file secret-free: measured on buildx
           # v0.30 / BuildKit v0.26, `min` writes every build-arg VALUE and every secret ID under
@@ -273,18 +340,28 @@ jobs:
           while IFS= read -r line; do
             [ -n "${line// /}" ] && args+=( --build-arg "${line}" )
           done <<< "${BUILD_ARGS}"
+
+          # One `--build-context` and its value per line, written by the step above.
+          pins=()
+          if [ -s "${PIN_ARGS_FILE:-/nonexistent}" ]; then
+            mapfile -t pins < "${PIN_ARGS_FILE}"
+          fi
+
           docker buildx build \
             --platform "${{ inputs.platform }}" \
             --target "${{ inputs.build-target }}" \
             --file "${{ inputs.dockerfile }}" \
             --secret id=composer_auth,env=COMPOSER_AUTH \
             "${args[@]}" \
+            "${pins[@]+"${pins[@]}"}" \
             --tag "${LOCAL_REF}" \
             --metadata-file "${METADATA_FILE}" \
             --load \
             "${{ inputs.build-context }}"
-          echo "local-ref=${LOCAL_REF}" >> "$GITHUB_OUTPUT"
-          echo "metadata-file=${METADATA_FILE}" >> "$GITHUB_OUTPUT"
+          {
+            echo "local-ref=${LOCAL_REF}"
+            echo "metadata-file=${METADATA_FILE}"
+          } >> "$GITHUB_OUTPUT"
 
       # WHY: ekwi/php:${PHP_IMAGE_VERSION} is a MAJOR-line tag, re-published in place. Without recording which
       # bytes it resolved to, an upstream base change is indistinguishable from a build defect. Read from
@@ -342,6 +419,83 @@ jobs:
             echo
             echo "_\`built\` is the manifest buildx produced, not the digest the registry returns after push._"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # An input wired to a job output can go empty without anyone noticing, and the gate below is
+      # conditioned on it. Say so in the summary rather than let a silently unpinned release look normal.
+      - name: Say so when nothing is pinned
+        if: inputs.base-image-pins == ''
+        run: echo "⚠ Bases were NOT pinned — base-image-pins is empty, so they resolved through their tags." >> "$GITHUB_STEP_SUMMARY"
+
+      # WHY a gate, and not a note: buildx SILENTLY IGNORES a --build-context key that matches no FROM —
+      # exit 0, green build, base resolved through its tag.
+      #
+      # ⚠ And why it reads the purl rather than the digest alone. On the day the pins are written, the tag
+      # resolves to the very digest that was read to write them, so a mistyped key yields a base that is
+      # unpinned AND carries a listed digest: a comparison of values alone passes it. The provenance tells
+      # the two apart —
+      #   resolved through a pin : pkg:docker/<name>[@<tag>]?digest=sha256:…
+      #   resolved through a tag : pkg:docker/<name>@<tag>            (no digest= at all)
+      # The discriminant is `digest=sha256:` IN THE URI, not the absence of `@<tag>`: a pinned base keeps its
+      # tag here, because the step above keeps it in the reference it hands buildx.
+      #
+      # Measured locally on buildx v0.30.1 / BuildKit v0.26.2. ⚠ The CI engine is NOT that one: this workflow
+      # sets up `docker-container` on `moby/buildkit:buildx-stable-1`, a moving tag — the shapes above were
+      # replayed on v0.34.2 on 2026-11-19 and held, but the engine floats and this is the thing to re-measure
+      # the day the gate refuses everything.
+      - name: Verify every base was pinned
+        if: inputs.base-image-pins != ''
+        env:
+          METADATA_FILE: ${{ steps.build.outputs.metadata-file }}
+          PINS_FILE: ${{ steps.pins.outputs.pins-file }}
+        run: |
+          set -euo pipefail
+          # No continue-on-error and no soft exit, unlike the record step above: a pin that cannot be
+          # verified must not be announced as one.
+          command -v jq >/dev/null 2>&1 \
+            || { echo "::error::jq not found — the pin cannot be verified"; exit 1; }
+          for f in "${METADATA_FILE}" "${PINS_FILE}"; do
+            [ -f "${f}" ] || { echo "::error::${f} is missing — the pin cannot be verified"; exit 1; }
+          done
+
+          # Three fields: the digest, the purl KEY (`<name>` or `<name>@<tag>`, which is how buildx writes a
+          # reference), and the raw uri for the message. `no-digest` is a sentinel that can never match a
+          # pin — `// empty` would DROP a material carrying no digest, and the gate would bless what it never
+          # observed, against its own rule two lines down.
+          resolved=$(jq -r '
+            ((.["buildx.build.provenance"].materials // [])
+             + (.["buildx.build.provenance"].buildDefinition.resolvedDependencies // []))
+            | .[] | select((.uri // "") | startswith("pkg:docker/"))
+            | "\(.digest.sha256 // "no-digest") \(.uri | sub("^pkg:docker/";"") | sub("[?].*$";"")) \(.uri)"
+          ' "${METADATA_FILE}")
+
+          # Refusing is the only safe reading: we cannot claim a pin we did not observe. ⚠ A multi-platform
+          # build suffixes the provenance key (`buildx.build.provenance/linux/amd64`) and lands here; this
+          # workflow is single-platform by design, so that path means the shape changed under us.
+          [ -n "${resolved}" ] || {
+            echo "::error::no base image in the provenance — refusing to claim a pin. If this build became multi-platform, the provenance key is now suffixed and this gate must be taught the new shape."
+            exit 1
+          }
+
+          rc=0
+          while IFS=' ' read -r digest key uri; do
+            [ -n "${digest}" ] || continue
+            case "${uri}" in
+              *"digest=sha256:"*) ;;
+              *)
+                echo "::error::${uri} was resolved through its TAG, not through a pin. Everything buildx pulls is listed here, not just FROM lines: the \`# syntax=\` frontend, an image named by \`COPY --from=<image>\` or \`RUN --mount=from=<image>\`. Add \`${key/@/:}=sha256:…\` to base-image-pins, writing the reference as it appears AFTER ARG expansion."
+                rc=1
+                continue
+                ;;
+            esac
+            # -x -F on the PAIR: a digest is a literal, and a prefix match would accept a truncated one.
+            # ⚠ What this gate proves is that the build FOLLOWED the list. Nothing here proves the list is
+            # right — see the note in the compose step.
+            grep -qxF -- "${key} ${digest}" "${PINS_FILE}" \
+              || { echo "::error::${uri} resolved to a digest that base-image-pins does not list for ${key}"; rc=1; }
+          done <<< "${resolved}"
+
+          [ "${rc}" -eq 0 ] || exit 1
+          echo "Every base of the built target was resolved through a pinned digest."
 
       # Scanning follows "block where we can fix, report where we can't":
       #   - OS packages (Debian) are gated upstream in docker-php and not fixable here → REPORT-only (SARIF).
