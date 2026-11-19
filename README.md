@@ -177,6 +177,8 @@ jobs:
       initial-version: '0.1.0'
       ci-workflows: 'ci.yml'
       build-args: ${{ needs.build-inputs.outputs.build-args }}
+      # base-image-pins: |        # the SAME list in both callers, and EVERY base — see "Pinning the
+      #   …                        # base images by digest" below; a partial list fails the build
       # self-hosted-registry: registry.ekwi.tech   # uncomment once it is up (dual-push; deploys pull from it)
     secrets:
       composer-auth: ${{ secrets.COMPOSER_AUTH }}
@@ -213,6 +215,8 @@ jobs:
       channel: pre-release      # ignored under dry-run, but the input is required
       dry-run: true
       build-args: ${{ needs.build-inputs.outputs.build-args }}
+      # base-image-pins: |        # the SAME list in both callers, and EVERY base — see "Pinning the
+      #   …                        # base images by digest" below; a partial list fails the build
     secrets:
       composer-auth: ${{ secrets.COMPOSER_AUTH }}
 ```
@@ -221,8 +225,62 @@ Make **`build / <reusable job name>`** a required check in the ruleset — **two
 under Semantic Checks below. Select it from the detected-checks list rather than typing it.
 
 Docker-specific inputs beyond the shared table: `image-name` (defaults to `github.repository`), `dockerfile`,
-`build-target`, `build-context`, `build-args`, `platform`, `ghcr-registry`, `self-hosted-registry`,
-`trivy-severity`, `trivy-lib-skip-dirs`.
+`build-target`, `build-context`, `build-args`, `base-image-pins`, `platform`, `ghcr-registry`,
+`self-hosted-registry`, `trivy-severity`, `trivy-lib-skip-dirs`.
+
+### Pinning the base images by digest
+
+`ekwi/php:<major>` is a **major-line tag, re-published in place**: two builds of the same commit, days apart,
+can sit on different bytes. `base-image-pins` closes that — one `<ref>=sha256:<hex>` per line, each becoming a
+named build context that substitutes the matching reference. For `ekwi_prod` of the next-major skeleton that
+is **three** lines, not two:
+
+```yaml
+      base-image-pins: |
+        docker/dockerfile:1.10=sha256:<64 lowercase hex>   # the `# syntax=` frontend
+        ekwi/php:5=sha256:<64 lowercase hex>               # the runtime stage
+        ekwi/php:5-builder=sha256:<64 lowercase hex>       # the builder stage
+```
+
+⚠ **Everything buildx pulls counts, not just `FROM` lines.** The `# syntax=` frontend on line 1 of the
+Dockerfile is a material like any other, and so is an image named by `COPY --from=<image>` or
+`RUN --mount=from=<image>`. Only a `COPY --from=<stage>` — an internal stage — is exempt. Miss one and the
+build is refused; the error names the image and prints the line to add. `ekwi_dev` is not in `ekwi_prod`'s
+graph, so its base is not pinned here.
+
+⚠ **The ref is the reference AFTER the `ARG` expansion** — `ekwi/php:5-builder`, never
+`ekwi/php:${PHP_IMAGE_VERSION}-builder`, which buildx rejects outright.
+
+⚠ **Pass the same list to the PR gate as to the release** — same rule as `keys:` above, and for the same
+reason: a gate that builds on other bytes than the release does not gate that release.
+
+Read a digest with `docker buildx imagetools inspect ekwi/php:5 | awk '/^Digest:/{print $2; exit}'`, or take
+it from the **Images by digest** table every run writes to its summary. ⚠ Not
+`--format '{{.Manifest.Digest}}'`: a template whose body is only a `.Manifest…` reference silently falls back
+to the full 10 KB human output.
+
+**What the check does, and what it cannot do.** When the input is set, the build fails unless every base was
+resolved *through a pin*. That is not belt-and-braces: buildx **silently ignores** a `--build-context` key
+that matches no reference, and on the day you read the digests the tag resolves to those very digests — so a
+typo yields a base that is unpinned *and* carries a listed digest. Comparing digest values alone passes it.
+The workflow therefore reads the build provenance, where a pinned base and a tag-resolved one are written
+differently, and refuses the second whatever its digest.
+
+⚠ **It proves the build followed your list. It cannot prove the list is right.** Two digests swapped between
+`ekwi/php:5` and `ekwi/php:5-builder` are obeyed to the letter and pass — measured. A digest belonging to a
+different image does not get that far: buildx fails to pull it.
+
+⚠ **Do not pin in the consumer's `Dockerfile`.** Template sync merges `-X theirs` without saying so and
+excludes neither the Dockerfile nor the compose file, so a digest written there is force-overwritten in every
+instance. (That sync is being replaced by `copier`; until it is, this holds.) The job pins, not the file.
+
+⚠ **There is no path from `.env` to this input.** The composite action above emits `--build-arg` lines only;
+a `PHP_IMAGE_DIGEST` added to `keys:` would travel as a build arg and pin nothing. Keeping the digests in
+`.env` is reasonable — it *is* excluded from template sync — but the caller has to read them into this input
+itself.
+
+Leaving the input empty keeps the previous behaviour: bases resolve through their tag, nothing is verified,
+and the run summary says so.
 
 ## Usage — Conventional-Commit PR title (every repo)
 
