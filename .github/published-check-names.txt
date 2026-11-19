@@ -9,5 +9,6 @@
 # the check sorts both sides. The CI diff prints the line to copy.
 commitlint-reusable.yml Conventional Commits on PR Title
 composer-release-reusable.yml Compute the version, prove CI green, tag and publish
+# "scan" is historical: the name is the contract, the job no longer scans (ekwi-tech/release-workflow#26).
 docker-image-release-reusable.yml Build the instance image, scan, push and release
 maven-sync-app-release-reusable.yml Build the deployable fat jar, tag and release

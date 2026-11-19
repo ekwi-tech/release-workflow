@@ -63,7 +63,7 @@ jobs:
 
   # Exercises the reusable workflow END TO END without cutting a real release: dry-run runs the version and notes
   # steps (the two wrapped actions, wired together) and skips the main-branch / green-gate / publish steps that
-  # cannot hold on a PR. This is the composite of both actions proven, the same spirit as their own self-tests.
+  # cannot hold on a PR.
   self-test:
     name: Exercise the reusable workflow (dry-run)
     # Least privilege: dry-run creates nothing, so read is enough. This is the CALLER's grant, and the reusable
@@ -213,8 +213,8 @@ jobs:
               pathlib.Path(os.environ["RUNNER_TEMP"] + "/" + out).write_text(step["run"])
           EXTRACT
 
-      # The writer is tested too, not just the gate: the two sides share a file format, and a writer that
-      # drifted from it would leave the gate's fixtures green while refusing every real build.
+      # The writer too, not just the gate: they share a file format, and a writer that drifted from it would
+      # leave the gate's fixtures green while refusing every real build.
       - name: The pin writer accepts and refuses what it claims
         env:
           A: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -304,8 +304,7 @@ jobs:
           # The multi-platform shape: the provenance key is suffixed, so nothing is found.
           printf '{"buildx.build.provenance/linux/amd64":{"materials":[%s]}}\n' \
             "$(mat "ekwi/php@5?digest=sha256:${A}" "${A}")" > md-multi.json
-          # The SLSA v1 branch. buildx normalises to `materials` today, so no real build reaches it — it is
-          # a belt, and an untested belt is a guess.
+          # The SLSA v1 branch: no real build reaches it today, buildx normalising to `materials`.
           printf '{"buildx.build.provenance":{"buildDefinition":{"resolvedDependencies":[%s]}}}\n' \
             "$(mat "ekwi/php@5?digest=sha256:${A}&platform=linux%2Famd64" "${A}")" > md-v1-pinned.json
           printf '{"buildx.build.provenance":{"buildDefinition":{"resolvedDependencies":[%s]}}}\n' \
@@ -318,9 +317,7 @@ jobs:
           set -euo pipefail
           cd "${RUNNER_TEMP}"
           fail=0
-          # ⚠ The MESSAGE is asserted, not only the exit code: several branches exit 1, and an assertion that
-          # reads the code alone passes for the wrong reason — measured on the no-digest fixture, which was
-          # caught by the empty guard rather than by the sentinel it claimed to prove.
+          # ⚠ The message is asserted, not only the exit code: several branches exit 1.
           expect() {
             want="$1"; file="$2"; frag="$3"; label="$4"
             set +e

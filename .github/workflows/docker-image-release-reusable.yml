@@ -1,8 +1,8 @@
 name: _Reusable — Docker image release
 
-# Reusable (workflow_call): release an Ekwi instance as a Docker image — build ekwi_prod, scan (Trivy), push to GHCR
+# Reusable (workflow_call): release an Ekwi instance as a Docker image — build ekwi_prod, push to GHCR
 # (and an optional self-hosted registry), then cut the GitHub Release. The PR CI gate calls this same workflow with
-# dry-run: true (build + scan only, no version/gate/push/release), so the build logic lives once.
+# dry-run: true (build only, no version/gate/push/release), so the build logic lives once.
 on:
   workflow_call:
     inputs:
@@ -60,7 +60,7 @@ on:
         type: string
         default: ''
       platform:
-        description: 'Target platform (single — the image is --load-ed into the daemon so Trivy scans the exact bytes).'
+        description: 'Target platform. Single: the push path and the pin gate handle one — see the build step.'
         required: false
         type: string
         default: 'linux/amd64'
@@ -74,18 +74,8 @@ on:
         required: false
         type: string
         default: ''
-      trivy-severity:
-        description: 'Severities that fail the image scan.'
-        required: false
-        type: string
-        default: 'HIGH,CRITICAL'
-      trivy-lib-skip-dirs:
-        description: 'Dirs excluded from the dependency (library) gate — the base runtime under /usr/local (global npm, FrankenPHP, PHP) is not owned by the instance; app deps live under /app.'
-        required: false
-        type: string
-        default: 'usr/local'
       dry-run:
-        description: 'Build and scan only — no version, no green gate, no push, no release. This is the PR CI gate mode.'
+        description: 'Build only — no version, no green gate, no push, no release. This is the PR CI gate mode.'
         required: false
         type: boolean
         default: false
@@ -115,6 +105,7 @@ concurrency:
 
 jobs:
   release:
+    # "scan" is historical: the name is a published contract — .github/published-check-names.txt.
     name: Build the instance image, scan, push and release
     runs-on: ubuntu-latest
     timeout-minutes: 30   # a full image build (composer + vite + pnpm) is heavier than tag-only; must not hang for hours
@@ -190,7 +181,6 @@ jobs:
             echo "::error::Tag v${VERSION} already exists"; exit 1
           fi
 
-      # "Green before ship." Gates on the caller-named CI workflows for THIS exact commit. Skipped under dry-run.
       - name: Require a successful CI run on this commit
         if: ${{ !inputs.dry-run }}
         env:
@@ -249,25 +239,9 @@ jobs:
           username: ${{ secrets.registry-user }}
           password: ${{ secrets.registry-token }}
 
-      # Free disk on GitHub-hosted runners only: the image plus buildx layers plus Trivy's DBs can exhaust the
-      # ~14 GB runner (observed: Trivy's 897 MB Java DB hit "no space left"). Skipped on self-hosted (large disk;
-      # and a global rm on a shared host could hit concurrent jobs — isolation there comes from ephemeral runners).
-      - name: Free runner disk space (best-effort)
-        if: runner.environment == 'github-hosted'
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL 2>/dev/null || true
-          df -h / | tail -1 || true
-
-      # Build into the local daemon (--load) so Trivy scans the EXACT bytes before any push. Single platform by
-      # design (--load is single-arch; prod is amd64). The composer token is a BuildKit secret, never a layer.
-      # Separate from the build on purpose: this step is pure text, so the self-test in ci.yml extracts it and
-      # runs it, exactly as it does the gate. Inline, its branches were unreachable — and the registry-port
-      # branch nobody could reach was the proof that an untested decision is a guess.
-      #
-      # Each pin becomes a named build context keyed on the resolved FROM reference. Measured on buildx
-      # v0.30.1 / BuildKit v0.26.2: the key is matched AFTER the ARG expansion, so `ekwi/php:5-builder`
-      # substitutes `FROM ekwi/php:${PHP_IMAGE_VERSION}-builder`, and the literal `${…}` form is rejected
-      # outright (`invalid context name`).
+      # Its own step so ci.yml can extract and run it.
+      # Each pin is a named build context keyed on the FROM reference AFTER the ARG expansion — the literal
+      # `${…}` form is rejected as an invalid reference.
       - name: Compose the base-image pins
         id: pins
         if: inputs.base-image-pins != ''
@@ -293,16 +267,9 @@ jobs:
             # format` — later and further from the cause, which is what this guard exists to avoid.
             printf '%s' "${digest}" | grep -qE '^sha256:[0-9a-f]{64}$' \
               || { echo "::error::base-image-pins: '${line}' — expected <ref>=sha256:<64 lowercase hex>"; exit 1; }
-            # The TAG IS KEPT in the digest reference. Measured: `docker-image://img:tag@sha256:…` resolves,
-            # and the provenance then writes `pkg:docker/img@tag?digest=…`, tag included. A first version
-            # stripped it, which made the pinned purl tagless and the check below coarser than it needs to be.
+            # The tag is kept: buildx then writes `img@tag?digest=…`, the key the gate pairs with the digest.
             printf -- '--build-context\n%s=docker-image://%s@%s\n' "${ref}" "${ref}" "${digest}" >> "${PIN_ARGS_FILE}"
-            # The purl key buildx will write for this ref: the tag goes after `@`, not `:`. Pairing the key
-            # with the digest makes the gate a CONSISTENCY check — did the build resolve each base to the
-            # digest we asked for it. ⚠ It is not, and cannot be, a check that the LIST is right: two digests
-            # swapped between `ekwi/php:5` and `ekwi/php:5-builder` are obeyed to the letter and pass.
-            # Measured. A digest belonging to a different image does not get that far — buildx fails to pull
-            # it, before the gate.
+            # The purl key buildx will write for this ref: the tag goes after `@`, not `:`.
             # ⚠ A registry with a PORT is out of scope: buildx percent-encodes it (`localhost%3A5000/img`),
             # so this key would never match and the build would be refused. Short and namespaced Docker Hub
             # names are what the fleet uses.
@@ -315,24 +282,32 @@ jobs:
             echo "pins-file=${PINS_FILE}"
           } >> "$GITHUB_OUTPUT"
 
+      # GitHub-hosted only: a global rm on a shared self-hosted runner could hit concurrent jobs.
+      # Kept until measured — `--load` stores the image twice (builder cache, daemon). The two `df` are the
+      # measure: compare them over a few runs, then decide. It costs ~90 s.
+      - name: Free runner disk space (best-effort)
+        if: runner.environment == 'github-hosted'
+        run: |
+          df -h / | tail -1 || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          df -h / | tail -1 || true
+
+      # `--load`: the push step tags and pushes from the local daemon, so the image must be in it.
+      # Single-platform is a choice (production is amd64), not a limit of the flag. An ARM target means a
+      # native arm64 leg — QEMU does not survive composer + vite — hence a per-arch push by digest and a
+      # merge job, as docker-php does, and a pin gate taught the multi-platform provenance shape.
       - name: Build the image
         id: build
         env:
+          # A BuildKit secret, never a layer.
           COMPOSER_AUTH: ${{ secrets.composer-auth }}
           LOCAL_REF: local-ci/${{ steps.img.outputs.name }}:build-${{ github.sha }}
           BUILD_ARGS: ${{ inputs.build-args }}
           PIN_ARGS_FILE: ${{ steps.pins.outputs.args-file }}
-          # `min` is the buildx default today; pinning it freezes the contract and keeps the 9 KB LLB graph
-          # that `max` adds out of the file. ⚠ It does NOT make the file secret-free: measured on buildx
-          # v0.30 / BuildKit v0.26, `min` writes every build-arg VALUE and every secret ID under
-          # `invocation.parameters`. Only `disabled` drops them — and it drops the materials too, which is the
-          # whole point here. ⚠ Not the same knob as BuildKit's `--provenance=mode=min`, which DOES scrub them
-          # from the attestation attached to the image. Check: `jq '.["buildx.build.provenance"].invocation
-          # .parameters | has("args")'` — without printing the value. So: never upload this file as an artifact,
-          # and never cat it into a log.
+          # `min` pinned: `disabled` would drop the materials the gate reads. ⚠ The file still holds every
+          # build-arg value and secret ID (`invocation.parameters`): never upload it, never cat it into a log.
           BUILDX_METADATA_PROVENANCE: min
-          # Outside the checkout: the workspace IS the default build context, and a caller with a permissive
-          # .dockerignore would COPY this file into a later image.
+          # Outside the checkout, same reason as the pin files above.
           METADATA_FILE: ${{ runner.temp }}/build-metadata.json
         run: |
           set -euo pipefail
@@ -397,7 +372,7 @@ jobs:
             # ConvertToSLSA02() before writing (build/provenance.go). The v1 branch below is a belt for the day
             # that conversion goes away — it costs one `+` and never evaluates meanwhile. ⚠ A THIRD shape exists:
             # multi-platform builds suffix the key (`buildx.build.provenance/linux/amd64`) and would read as
-            # empty. Out of reach while this workflow is single-platform by design (`--load` refuses a list).
+            # empty. Out of reach while this workflow is single-platform — see the build step.
             jq -r '
               ((.["buildx.build.provenance"].materials // [])
                + (.["buildx.build.provenance"].buildDefinition.resolvedDependencies // []))
@@ -406,9 +381,9 @@ jobs:
                 else .[] | "| base | `\(.uri)` | `sha256:\(.digest.sha256 // "")` |"
                 end
             ' "${METADATA_FILE}"
-            # The local ref that was built and scanned, and the manifest buildx produced for it. ⚠ NOT the
-            # digest GHCR returns: the push recomposes the manifest from the daemon. When there is a push
-            # (never under dry-run), compare against the `digest:` line of that step, not against this one.
+            # The local ref that was built, and the manifest buildx produced for it. This used to warn that
+            # the push recomposes the manifest and returns another digest; measured on a containerd image
+            # store — the one the runner has — buildx and the registry return the SAME digest.
             # Assigned, not inlined in printf: under `set -e` the status of a command substitution used as an
             # argument is discarded, so a broken jq would print an empty cell under a green step.
             built_digest=$(jq -r '."containerimage.digest" // "none"' "${METADATA_FILE}")
@@ -417,7 +392,7 @@ jobs:
             printf '| **built** | `%s` | `%s` |\n' \
               "${BUILT_REF}" "${built_digest}"
             echo
-            echo "_\`built\` is the manifest buildx produced, not the digest the registry returns after push._"
+            echo "_\`built\` is the manifest buildx produced; on a containerd image store the push returns the same digest._"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # An input wired to a job output can go empty without anyone noticing, and the gate below is
@@ -426,22 +401,17 @@ jobs:
         if: inputs.base-image-pins == ''
         run: echo "⚠ Bases were NOT pinned — base-image-pins is empty, so they resolved through their tags." >> "$GITHUB_STEP_SUMMARY"
 
-      # WHY a gate, and not a note: buildx SILENTLY IGNORES a --build-context key that matches no FROM —
-      # exit 0, green build, base resolved through its tag.
+      # A gate, not a note: buildx SILENTLY IGNORES a --build-context key that matches no FROM — exit 0,
+      # green build, base resolved through its tag.
       #
-      # ⚠ And why it reads the purl rather than the digest alone. On the day the pins are written, the tag
-      # resolves to the very digest that was read to write them, so a mistyped key yields a base that is
-      # unpinned AND carries a listed digest: a comparison of values alone passes it. The provenance tells
-      # the two apart —
+      # ⚠ And it reads the purl, not the digest alone: on the day the pins are written the tag resolves to
+      # the very digest that was read to write them, so a mistyped key yields a base that is unpinned AND
+      # carries a listed digest. The provenance tells the two apart —
       #   resolved through a pin : pkg:docker/<name>[@<tag>]?digest=sha256:…
-      #   resolved through a tag : pkg:docker/<name>@<tag>            (no digest= at all)
-      # The discriminant is `digest=sha256:` IN THE URI, not the absence of `@<tag>`: a pinned base keeps its
-      # tag here, because the step above keeps it in the reference it hands buildx.
+      #   resolved through a tag : pkg:docker/<name>@<tag>
       #
-      # Measured locally on buildx v0.30.1 / BuildKit v0.26.2. ⚠ The CI engine is NOT that one: this workflow
-      # sets up `docker-container` on `moby/buildkit:buildx-stable-1`, a moving tag — the shapes above were
-      # replayed on v0.34.2 on 2026-11-19 and held, but the engine floats and this is the thing to re-measure
-      # the day the gate refuses everything.
+      # ⚠ The CI engine floats: `docker-container` on `moby/buildkit:buildx-stable-1`. These shapes are what
+      # to re-measure the day the gate refuses everything; `ci.yml` pins them as fixtures.
       - name: Verify every base was pinned
         if: inputs.base-image-pins != ''
         env:
@@ -457,10 +427,8 @@ jobs:
             [ -f "${f}" ] || { echo "::error::${f} is missing — the pin cannot be verified"; exit 1; }
           done
 
-          # Three fields: the digest, the purl KEY (`<name>` or `<name>@<tag>`, which is how buildx writes a
-          # reference), and the raw uri for the message. `no-digest` is a sentinel that can never match a
-          # pin — `// empty` would DROP a material carrying no digest, and the gate would bless what it never
-          # observed, against its own rule two lines down.
+          # Digest, purl key, raw uri. `no-digest` is a sentinel that can never match a pin: `// empty`
+          # would drop a material carrying no digest, and the gate would bless what it never observed.
           resolved=$(jq -r '
             ((.["buildx.build.provenance"].materials // [])
              + (.["buildx.build.provenance"].buildDefinition.resolvedDependencies // []))
@@ -488,8 +456,8 @@ jobs:
                 ;;
             esac
             # -x -F on the PAIR: a digest is a literal, and a prefix match would accept a truncated one.
-            # ⚠ What this gate proves is that the build FOLLOWED the list. Nothing here proves the list is
-            # right — see the note in the compose step.
+            # ⚠ This proves the build FOLLOWED the list, never that the list is right: two digests swapped
+            # between two tags of one image are obeyed to the letter and pass.
             grep -qxF -- "${key} ${digest}" "${PINS_FILE}" \
               || { echo "::error::${uri} resolved to a digest that base-image-pins does not list for ${key}"; rc=1; }
           done <<< "${resolved}"
@@ -497,49 +465,7 @@ jobs:
           [ "${rc}" -eq 0 ] || exit 1
           echo "Every base of the built target was resolved through a pinned digest."
 
-      # Scanning follows "block where we can fix, report where we can't":
-      #   - OS packages (Debian) are gated upstream in docker-php and not fixable here → REPORT-only (SARIF).
-      #   - dependencies (Composer/npm under /app) are ours and fixable here → BLOCKING. The base runtime under
-      #     /usr/local (global npm, FrankenPHP's Go, PHP) is also `library`-typed but NOT ours — it is skip-dir'd
-      #     from the gate (see trivy-lib-skip-dirs) and covered by docker-php's own scan.
-      - name: Trivy — report base OS vulnerabilities (non-blocking)
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          scan-type: image
-          image-ref: ${{ steps.build.outputs.local-ref }}
-          scanners: vuln
-          vuln-type: os
-          severity: ${{ inputs.trivy-severity }}
-          ignore-unfixed: true
-          exit-code: '0'
-          format: sarif
-          output: trivy-os.sarif
-
-      # Best-effort: land the OS report in the Security tab for tracking (not "under the rug"). Requires the caller
-      # to grant `security-events: write`; continue-on-error keeps a missing grant from failing the build.
-      - name: Upload base OS report to the Security tab (best-effort)
-        if: ${{ hashFiles('trivy-os.sarif') != '' }}
-        continue-on-error: true
-        uses: github/codeql-action/upload-sarif@4187e74d05793876e9989daffde9c3e66b4acd07 # v3
-        with:
-          sarif_file: trivy-os.sarif
-          category: trivy-os
-
-      - name: Trivy — fail on fixable HIGH/CRITICAL in dependencies
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          scan-type: image
-          image-ref: ${{ steps.build.outputs.local-ref }}
-          scanners: vuln
-          vuln-type: library
-          skip-dirs: ${{ inputs.trivy-lib-skip-dirs }}
-          severity: ${{ inputs.trivy-severity }}
-          ignore-unfixed: true
-          exit-code: '1'
-          format: table
-
-      # Tag the SCANNED local image to the final refs and push. `:latest` tracks the last STABLE release only
-      # (a pre-release is reachable by its exact version tag, never promoted to latest).
+      # `:latest` tracks the last STABLE release only — a pre-release stays reachable by its exact version.
       - name: Push the image
         if: ${{ !inputs.dry-run }}
         env:
@@ -593,4 +519,4 @@ jobs:
       - name: Dry-run summary
         if: ${{ inputs.dry-run }}
         run: |
-          echo "::notice::[dry-run] image built (${{ steps.build.outputs.local-ref }}) and scanned — no version, no push, no release. CI gate OK."
+          echo "::notice::[dry-run] image built (${{ steps.build.outputs.local-ref }}) — no version, no push, no release. CI gate OK."
